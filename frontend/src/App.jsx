@@ -1,10 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import axios from 'axios';
 import { 
   Database, Zap, BookOpen, BarChart3,
   TerminalSquare, Loader2, CheckCircle2, XCircle, AlertCircle,
-  Unplug, Server, User, Lock, Hash, Globe
+  Unplug, Server, User, Lock, Hash, Globe, Gamepad2, Link, Play, Table2
 } from 'lucide-react';
+import PlaygroundSection from './PlaygroundSection';
+import MarkdownRenderer from './MarkdownRenderer';
+import useSession from './useSession';
 
 const API_BASE = 'http://localhost:8000/api';
 
@@ -16,7 +19,8 @@ const DIALECTS = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab]   = useState('nl_sql');
+  const sessionId = useSession();
+  const [activeTab, setActiveTab]   = useState('playground');
   const [connection, setConnection] = useState(null);
   const [connecting, setConnecting] = useState(false);
   const [connError, setConnError]   = useState('');
@@ -42,7 +46,7 @@ export default function App() {
     setConnecting(true);
     setConnError('');
     try {
-      await axios.post(`${API_BASE}/connect`, dbConfig);
+      await axios.post(`${API_BASE}/connect`, { ...dbConfig, session_id: sessionId });
       setConnection(dbConfig);
     } catch (err) {
       setConnError(err.response?.data?.detail || err.message);
@@ -65,14 +69,22 @@ export default function App() {
           <div className="logo-text">OptiVox DB</div>
         </div>
 
-        {connection && (
-          <nav className="nav-menu">
-            <NavBtn id="nl_sql"    icon={<TerminalSquare />} label="NL → SQL"          active={activeTab} set={setActiveTab} />
-            <NavBtn id="teach"     icon={<BookOpen />}       label="Database Tutor"    active={activeTab} set={setActiveTab} />
-            <NavBtn id="optimize"  icon={<Zap />}            label="Query Optimizer"   active={activeTab} set={setActiveTab} />
-            <NavBtn id="schema"    icon={<BarChart3 />}      label="Schema Analysis"   active={activeTab} set={setActiveTab} />
-          </nav>
-        )}
+        <nav className="nav-menu">
+          {!connection && (
+            <NavBtn id="connect" icon={<Database />} label="Connect DB" active={(activeTab === 'playground' || activeTab === 'developer') ? '' : 'connect'} set={(id) => setActiveTab(id === 'connect' ? 'nl_sql' : id)} />
+          )}
+          {connection && (
+            <>
+              <NavBtn id="nl_sql"    icon={<TerminalSquare />} label="NL → SQL"          active={activeTab} set={setActiveTab} />
+              <NavBtn id="teach"     icon={<BookOpen />}       label="Database Tutor"    active={activeTab} set={setActiveTab} />
+              <NavBtn id="optimize"  icon={<Zap />}            label="Query Optimizer"   active={activeTab} set={setActiveTab} />
+              <NavBtn id="schema"    icon={<BarChart3 />}      label="Schema Analysis"   active={activeTab} set={setActiveTab} />
+            </>
+          )}
+          <div style={{ margin: '0.5rem 0', borderTop: '1px solid var(--border-color)' }}></div>
+          <NavBtn id="playground" icon={<Gamepad2 />}      label="SQL Playground"    active={activeTab} set={setActiveTab} />
+          <NavBtn id="developer"  icon={<User />}          label="Developer"         active={activeTab} set={setActiveTab} />
+        </nav>
 
         <div className="sidebar-spacer" />
 
@@ -97,10 +109,15 @@ export default function App() {
 
       {/* ── Main Content ── */}
       <main className="main-content">
-        {!connection ? (
+        {activeTab === 'playground' ? (
+          <PlaygroundSection />
+        ) : activeTab === 'developer' ? (
+          <DeveloperSection />
+        ) : !connection ? (
           <ConnectScreen
             dbConfig={dbConfig}
             setField={setField}
+            setDbConfig={setDbConfig}
             handleDialectChange={handleDialectChange}
             handleConnect={handleConnect}
             connecting={connecting}
@@ -108,9 +125,9 @@ export default function App() {
           />
         ) : (
           <>
-            {activeTab === 'nl_sql'   && <NLSqlSection   connection={connection} />}
-            {activeTab === 'teach'    && <TeachSection />}
-            {activeTab === 'optimize' && <OptimizeSection connection={connection} />}
+            {activeTab === 'nl_sql'   && <NLSqlSection   connection={connection} sessionId={sessionId} />}
+            {activeTab === 'teach'    && <TeachSection sessionId={sessionId} />}
+            {activeTab === 'optimize' && <OptimizeSection connection={connection} sessionId={sessionId} />}
             {activeTab === 'schema'   && <SchemaSection  connection={connection} />}
           </>
         )}
@@ -135,7 +152,42 @@ function NavBtn({ id, icon, label, active, set }) {
 /* ────────────────────────────────────────────────────────
    Connection Setup Screen (main area)
 ──────────────────────────────────────────────────────── */
-function ConnectScreen({ dbConfig, setField, handleDialectChange, handleConnect, connecting, connError }) {
+function ConnectScreen({ dbConfig, setField, setDbConfig, handleDialectChange, handleConnect, connecting, connError }) {
+  const [dbUrl, setDbUrl] = useState('');
+
+  const handleUrlParse = (url) => {
+    setDbUrl(url);
+    if (!url.trim()) return;
+    try {
+      const parsed = new URL(url.trim());
+      
+      let dialect = parsed.protocol.replace(':', '');
+      if (dialect === 'postgresql') dialect = 'postgres';
+      
+      const newConfig = { ...dbConfig };
+      
+      if (dialect) {
+        const matchingDialect = DIALECTS.find(d => d.value === dialect);
+        if (matchingDialect) {
+          newConfig.dialect = dialect;
+          newConfig.port = matchingDialect.defaultPort;
+        }
+      }
+      
+      if (parsed.hostname) newConfig.host = parsed.hostname;
+      if (parsed.port) newConfig.port = parseInt(parsed.port, 10);
+      if (parsed.username) newConfig.user = decodeURIComponent(parsed.username);
+      if (parsed.password) newConfig.password = decodeURIComponent(parsed.password);
+      if (parsed.pathname && parsed.pathname.length > 1) {
+        newConfig.database = parsed.pathname.substring(1);
+      }
+      
+      setDbConfig(newConfig);
+    } catch (e) {
+      // Ignore parse errors
+    }
+  };
+
   return (
     <div className="connect-screen">
       <div className="connect-hero">
@@ -147,6 +199,24 @@ function ConnectScreen({ dbConfig, setField, handleDialectChange, handleConnect,
       </div>
 
       <form className="connect-form glass-card" onSubmit={handleConnect}>
+        {/* Paste URL */}
+        <div className="connect-field-group" style={{ marginBottom: '0.5rem' }}>
+          <label><Link size={14} /> Paste Connection URL</label>
+          <input
+            type="text"
+            placeholder="mysql://user:pass@host:3306/db"
+            value={dbUrl}
+            onChange={e => handleUrlParse(e.target.value)}
+            style={{ borderColor: 'var(--accent-primary)' }}
+          />
+        </div>
+        
+        <div style={{ display: 'flex', alignItems: 'center', margin: '0.5rem 0' }}>
+          <div style={{ flex: 1, height: '1px', background: 'var(--border-color)' }}></div>
+          <span style={{ padding: '0 1rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>OR ENTER MANUALLY</span>
+          <div style={{ flex: 1, height: '1px', background: 'var(--border-color)' }}></div>
+        </div>
+
         {/* Dialect Selector */}
         <div className="connect-dialect-row">
           {DIALECTS.map(d => (
@@ -244,19 +314,27 @@ function ConnectScreen({ dbConfig, setField, handleDialectChange, handleConnect,
 /* ────────────────────────────────────────────────────────
    1. Natural Language SQL Generation
 ──────────────────────────────────────────────────────── */
-function NLSqlSection({ connection }) {
+function NLSqlSection({ connection, sessionId }) {
   const [question, setQuestion] = useState('');
   const [mode,     setMode]     = useState('fast');
   const [loading,  setLoading]  = useState(false);
   const [result,   setResult]   = useState(null);
   const [error,    setError]    = useState('');
 
-  const generate = async () => {
-    if (!question) return;
+  const [explainLoading, setExplainLoading] = useState(false);
+  const [explanation,    setExplanation]    = useState('');
+
+  const [execLoading, setExecLoading] = useState(false);
+  const [execResult,  setExecResult]  = useState(null);
+  const [execError,   setExecError]   = useState('');
+
+  const generate = useCallback(async () => {
+    if (!question.trim()) return;
     setLoading(true); setError(''); setResult(null);
+    setExplanation(''); setExecResult(null); setExecError('');
     try {
       const res = await axios.post(`${API_BASE}/adia/nl-sql`, {
-        question, dialect: connection.dialect, connection, mode,
+        question, dialect: connection.dialect, connection, mode, session_id: sessionId,
       });
       setResult(res.data);
     } catch (err) {
@@ -264,32 +342,69 @@ function NLSqlSection({ connection }) {
     } finally {
       setLoading(false);
     }
-  };
+  }, [question, mode, connection, sessionId]);
+
+  const explainQuery = useCallback(async () => {
+    if (!result?.sql) return;
+    setExplainLoading(true); setExplanation('');
+    try {
+      const res = await axios.post(`${API_BASE}/adia/teach`, {
+        question: `Explain the following SQL query step by step, clearly and concisely. Use markdown formatting with numbered steps:\n\n\`\`\`sql\n${result.sql}\n\`\`\``,
+        session_id: sessionId,
+      });
+      setExplanation(res.data.answer);
+    } catch (err) {
+      setExplanation('**Error:** ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setExplainLoading(false);
+    }
+  }, [result, sessionId]);
+
+  const executeQuery = useCallback(async () => {
+    if (!result?.sql) return;
+    setExecLoading(true); setExecResult(null); setExecError('');
+    try {
+      const res = await axios.post(`${API_BASE}/execute`, {
+        sql: result.sql,
+        connection,
+        session_id: sessionId,
+      });
+      setExecResult(res.data);
+    } catch (err) {
+      setExecError(err.response?.data?.detail || err.message);
+    } finally {
+      setExecLoading(false);
+    }
+  }, [result, connection, sessionId]);
+
+  const isSafe = result && result.approved !== false && result.safe !== false;
 
   return (
     <div className="glass-card">
       <div className="header">
         <h1>Natural Language to SQL</h1>
-        <p>Translate plain English directly into safe, validated SQL queries.</p>
+        <p>Translate plain English directly into safe, validated SQL queries — then run and explain them inline.</p>
       </div>
 
       <div className="textarea-wrapper">
         <textarea
           className="query-input"
-          placeholder="e.g. Show me the top 5 users by total revenue this month..."
+          placeholder="e.g. Show me the top 5 students enrolled in 2024..."
           value={question}
           onChange={e => setQuestion(e.target.value)}
+          onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') generate(); }}
         />
       </div>
 
-      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '2rem' }}>
+      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1.5rem' }}>
         <select value={mode} onChange={e => setMode(e.target.value)} style={{ width: '220px' }}>
           <option value="fast">Fast (Single Model)</option>
           <option value="crew">Autonomous Agents (CrewAI)</option>
         </select>
         <button className="btn-primary" onClick={generate} disabled={loading} style={{ width: '200px' }}>
-          {loading ? <Loader2 className="loading-spinner" /> : 'Generate SQL'}
+          {loading ? <><Loader2 className="loading-spinner" size={18} /> Generating…</> : 'Generate SQL'}
         </button>
+        <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Ctrl+Enter to generate</span>
       </div>
 
       {error && (
@@ -300,15 +415,100 @@ function NLSqlSection({ connection }) {
 
       {result && (
         <div>
-          <div className={`status-badge ${result.approved === false || result.safe === false ? 'error' : ''}`}>
-            {result.approved !== false && result.safe !== false
-              ? <CheckCircle2 size={16} />
-              : <XCircle size={16} />}
-            {result.approved !== false && result.safe !== false
-              ? 'Validated & Safe'
-              : `Rejected: ${result.safety_reason || result.rejection_reason}`}
+          {/* Safety badge */}
+          <div className={`status-badge ${isSafe ? '' : 'error'}`} style={{ marginBottom: '0.75rem' }}>
+            {isSafe ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+            {isSafe ? 'Validated & Safe' : `Rejected: ${result.safety_reason || result.rejection_reason}`}
           </div>
+
+          {/* Generated SQL */}
           <div className="code-block">{result.sql}</div>
+
+          {/* Action buttons */}
+          {isSafe && (
+            <div className="nl-action-row">
+              <button className="nl-btn-run" onClick={executeQuery} disabled={execLoading}>
+                {execLoading ? <Loader2 className="loading-spinner" size={15} /> : <Play size={15} />}
+                {execLoading ? 'Running…' : 'Run Query'}
+              </button>
+              <button className="nl-btn-explain" onClick={explainQuery} disabled={explainLoading}>
+                {explainLoading ? <Loader2 className="loading-spinner" size={15} /> : <BookOpen size={15} />}
+                {explainLoading ? 'Explaining…' : 'Explain Query'}
+              </button>
+            </div>
+          )}
+
+          {/* Explanation panel */}
+          {(explanation || explainLoading) && (
+            <div className="explain-panel">
+              <div className="explain-panel-header">
+                <BookOpen size={16} /> Step-by-Step Explanation
+              </div>
+              {explainLoading
+                ? <div style={{ display:'flex', alignItems:'center', gap:'0.5rem', color:'var(--text-secondary)' }}><Loader2 className="loading-spinner" size={16}/> Generating explanation…</div>
+                : <MarkdownRenderer>{explanation}</MarkdownRenderer>
+              }
+            </div>
+          )}
+
+          {/* Execution error */}
+          {execError && (
+            <div className="status-badge error" style={{ margin: '1rem 0' }}>
+              <AlertCircle size={16} /> {execError}
+            </div>
+          )}
+
+          {/* Execution results */}
+          {execResult && (
+            <div className="exec-result-wrap">
+              <div className="exec-result-header">
+                <strong><Table2 size={16} /> Execution Results</strong>
+                <div className="exec-result-meta">
+                  {execResult.statements_executed > 1 && (
+                    <span>{execResult.statements_executed} statements</span>
+                  )}
+                  {execResult.row_count !== undefined && (
+                    <span className="exec-badge">{execResult.row_count} rows</span>
+                  )}
+                  {execResult.rows_affected !== undefined && (
+                    <span className="exec-badge">{execResult.rows_affected} rows affected</span>
+                  )}
+                  <span>{execResult.duration_ms} ms</span>
+                </div>
+              </div>
+
+              {execResult.columns && execResult.columns.length > 0 ? (
+                <>
+                  <div className="exec-table-scroll">
+                    <table className="exec-table">
+                      <thead>
+                        <tr>{execResult.columns.map(c => <th key={c}>{c}</th>)}</tr>
+                      </thead>
+                      <tbody>
+                        {execResult.rows.map((row, i) => (
+                          <tr key={i}>
+                            {row.map((cell, j) => (
+                              <td key={j}>
+                                {cell === null
+                                  ? <span className="null-cell">NULL</span>
+                                  : String(cell)}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="exec-footer">{execResult.row_count} row{execResult.row_count !== 1 ? 's' : ''} returned.</div>
+                </>
+              ) : (
+                <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                  ✅ {execResult.statements_executed} statement{execResult.statements_executed !== 1 ? 's' : ''} executed successfully.
+                  {execResult.rows_affected !== undefined && execResult.rows_affected > 0 && ` ${execResult.rows_affected} rows affected.`}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -318,26 +518,26 @@ function NLSqlSection({ connection }) {
 /* ────────────────────────────────────────────────────────
    2. Teaching Section
 ──────────────────────────────────────────────────────── */
-function TeachSection() {
+function TeachSection({ sessionId }) {
   const [question, setQuestion] = useState('');
   const [loading,  setLoading]  = useState(false);
   const [history,  setHistory]  = useState([]);
 
-  const ask = async () => {
-    if (!question) return;
-    const q = question;
+  const ask = useCallback(async () => {
+    if (!question.trim()) return;
+    const q = question.trim();
     setHistory(prev => [...prev, { role: 'user', content: q }]);
     setQuestion('');
     setLoading(true);
     try {
-      const res = await axios.post(`${API_BASE}/adia/teach`, { question: q });
+      const res = await axios.post(`${API_BASE}/adia/teach`, { question: q, session_id: sessionId });
       setHistory(prev => [...prev, { role: 'assistant', content: res.data.answer }]);
     } catch (err) {
-      setHistory(prev => [...prev, { role: 'assistant', content: 'Error: ' + (err.response?.data?.detail || err.message) }]);
+      setHistory(prev => [...prev, { role: 'assistant', content: '**Error:** ' + (err.response?.data?.detail || err.message) }]);
     } finally {
       setLoading(false);
     }
-  };
+  }, [question, sessionId]);
 
   return (
     <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 6rem)' }}>
@@ -355,9 +555,11 @@ function TeachSection() {
             border:       h.role === 'user' ? '1px solid rgba(138,43,226,0.3)' : '1px solid var(--border-color)',
             alignSelf:    h.role === 'user' ? 'flex-end' : 'flex-start',
             maxWidth:     '80%',
-            whiteSpace:   'pre-wrap',
           }}>
-            {h.content}
+            {h.role === 'user'
+              ? <span style={{ color: 'var(--text-primary)' }}>{h.content}</span>
+              : <MarkdownRenderer>{h.content}</MarkdownRenderer>
+            }
           </div>
         ))}
         {loading && (
@@ -544,6 +746,45 @@ function SchemaSection({ connection }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────
+   5. Developer Section
+──────────────────────────────────────────────────────── */
+function DeveloperSection() {
+  return (
+    <div className="glass-card" style={{ maxWidth: '800px', margin: '0 auto', padding: '2rem', height: 'fit-content' }}>
+      <div className="header" style={{ marginBottom: '2rem' }}>
+        <h1>🚀 Developer</h1>
+      </div>
+      
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+        <div>
+          <h2 style={{ fontSize: '1.8rem', color: 'var(--accent-primary)', marginBottom: '0.5rem' }}>Kishore Ram M</h2>
+          <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1rem' }}>
+            <a href="https://github.com/KishoreRam-M" target="_blank" rel="noopener noreferrer" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-primary)', textDecoration: 'none', fontWeight: '500' }}>
+              🔗 GitHub
+            </a>
+            <a href="https://www.linkedin.com/in/kishoreramm/" target="_blank" rel="noopener noreferrer" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-primary)', textDecoration: 'none', fontWeight: '500' }}>
+              🔗 LinkedIn
+            </a>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', lineHeight: '1.6', color: 'var(--text-secondary)', fontSize: '1.05rem' }}>
+          <p>
+            I am a passionate AI & Machine Learning enthusiast with a deep interest in the rapidly evolving world of Generative AI. I enjoy building intelligent systems, experimenting with new technologies, and continuously expanding my knowledge to stay at the forefront of innovation.
+          </p>
+          <p>
+            Currently, I am a final-year Computer Science and Engineering student at Vel Tech Multi Tech Engineering College. My academic journey has equipped me with a strong foundation in software development, data structures, algorithms, and system design, enabling me to approach complex problems with a structured and analytical mindset.
+          </p>
+          <p>
+            I am also an aspiring Data Engineer, driven by a keen interest in designing scalable data pipelines, working with large datasets, and transforming raw data into meaningful insights. I am eager to contribute to real-world projects where I can apply my skills in data engineering, machine learning, and AI-driven solutions.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

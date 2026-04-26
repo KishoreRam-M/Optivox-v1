@@ -43,10 +43,9 @@ from app.models.auth import ConnectionModel, QueryRequest, ExecuteRequest
 from app.models.query_plan import ValidatedQueryPlan
 from app.database.connector import test_connection, get_engine, _conn_key
 from app.security.secrets import gemini_api_key
-from app.security.rbac import Role, check_permission
 from app.tools.sql_parser import validate_sql_ast
 from app.audit.audit_log import init_audit_db, log_audit_event, classify_severity
-from app.security.rbac_middleware import RBACMiddleware
+from app.api.playground import router as playground_router
 
 import litellm
 
@@ -124,7 +123,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(RBACMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -132,6 +130,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Sub-routers ───────────────────────────────────────────────────────────
+app.include_router(playground_router)
 
 # ── Rate limiting ─────────────────────────────────────────────────────────
 
@@ -329,13 +330,6 @@ async def execute_query(req: ExecuteRequest, request: Request):
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
-    # RBAC check (default to ADMIN when no auth header present — Phase 7 wires this fully)
-    role = Role.ADMIN
-    allowed, reason = check_permission(role, req.sql)
-    if not allowed:
-        logger.warning("Execute RBAC block: role=%s reason=%s", role.value, reason)
-        raise HTTPException(status_code=403, detail="Access denied: your role does not permit this operation.")
-
     # Safety validation
     is_safe, safety_reason = validate_sql_ast(req.sql, req.connection.dialect)
     
@@ -344,7 +338,6 @@ async def execute_query(req: ExecuteRequest, request: Request):
     if severity == "DANGER":
         log_audit_event(
             session_id=req.session_id or "default",
-            role=role.value,
             severity=severity,
             sql_text=req.sql,
             dialect=req.connection.dialect,
@@ -363,16 +356,34 @@ async def execute_query(req: ExecuteRequest, request: Request):
         def _run():
             engine = get_engine(req.connection.model_dump())
             start = time.time()
+
+            # Split into individual statements, skip empty ones
+            statements = [s.strip() for s in req.sql.split(';') if s.strip()]
+            last_result = None
+            total_rows_affected = 0
+            executed = 0
+
             with engine.connect() as conn:
-                result = conn.execute(sa_text(req.sql))
-                duration_ms = int((time.time() - start) * 1000)
-                if result.returns_rows:
-                    columns = list(result.keys())
-                    rows = [list(row) for row in result.fetchall()]
-                    return {"columns": columns, "rows": rows, "row_count": len(rows), "duration_ms": duration_ms}
-                else:
-                    conn.commit()
-                    return {"columns": [], "rows": [], "rows_affected": result.rowcount, "duration_ms": duration_ms}
+                for stmt in statements:
+                    result = conn.execute(sa_text(stmt))
+                    executed += 1
+                    if result.returns_rows:
+                        columns = list(result.keys())
+                        rows = [list(row) for row in result.fetchall()]
+                        last_result = {"columns": columns, "rows": rows, "row_count": len(rows)}
+                    else:
+                        total_rows_affected += result.rowcount if result.rowcount != -1 else 0
+                conn.commit()
+
+            duration_ms = int((time.time() - start) * 1000)
+            if last_result:
+                return {**last_result, "duration_ms": duration_ms, "statements_executed": executed}
+            return {
+                "columns": [], "rows": [],
+                "rows_affected": total_rows_affected,
+                "duration_ms": duration_ms,
+                "statements_executed": executed,
+            }
 
         data = await loop.run_in_executor(_executor, _run)
 
@@ -390,7 +401,7 @@ async def execute_query(req: ExecuteRequest, request: Request):
         return {"status": "success", **data}
     except Exception as exc:
         logger.error("Execution failed: %s", exc)
-        raise HTTPException(status_code=400, detail="Query execution failed. Please check your SQL and try again.")
+        raise HTTPException(status_code=400, detail=f"Query execution failed: {str(exc)}")
 
 
 # ── Schema endpoint ───────────────────────────────────────────────────────
