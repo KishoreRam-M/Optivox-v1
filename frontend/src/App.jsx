@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, Component } from 'react';
 import axios from 'axios';
 import { 
   Database, Zap, BookOpen, BarChart3,
@@ -11,12 +11,56 @@ import useSession from './useSession';
 
 const API_BASE = 'http://localhost:8000/api';
 
+// Global API error logging for production reliability and proper error handling
+axios.interceptors.response.use(
+  response => response,
+  error => {
+    console.error('[OptiVox] API Error:', error.response?.status, error.response?.data || error.message);
+    return Promise.reject(error);
+  }
+);
+
 const DIALECTS = [
   { value: 'mysql',    label: 'MySQL',      defaultPort: 3306  },
   { value: 'postgres', label: 'PostgreSQL', defaultPort: 5432  },
   { value: 'oracle',   label: 'Oracle',     defaultPort: 1521  },
   { value: 'mssql',   label: 'SQL Server',  defaultPort: 1433  },
 ];
+
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error("Application caught an error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: '2rem', display: 'flex', justifyContent: 'center', height: '100%' }}>
+          <div className="conn-error-box" style={{ maxWidth: '600px', flexDirection: 'column', alignItems: 'flex-start', height: 'fit-content' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
+              <AlertCircle size={24} />
+              <h2 style={{ margin: 0 }}>Something went wrong.</h2>
+            </div>
+            <p style={{ margin: '0 0 1rem 0' }}>{this.state.error?.toString()}</p>
+            <button className="btn-primary" onClick={() => window.location.reload()}>
+              Reload Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   const sessionId = useSession();
@@ -60,6 +104,10 @@ export default function App() {
     setConnError('');
   };
 
+  const handleNavClick = useCallback((id) => {
+    setActiveTab(id === 'connect' ? 'nl_sql' : id);
+  }, []);
+
   return (
     <div className="app-container">
       {/* ── Sidebar ── */}
@@ -71,19 +119,19 @@ export default function App() {
 
         <nav className="nav-menu">
           {!connection && (
-            <NavBtn id="connect" icon={<Database />} label="Connect DB" active={(activeTab === 'playground' || activeTab === 'developer') ? '' : 'connect'} set={(id) => setActiveTab(id === 'connect' ? 'nl_sql' : id)} />
+            <NavBtn id="connect" icon={<Database />} label="Connect DB" active={(activeTab === 'playground' || activeTab === 'developer') ? '' : 'connect'} set={handleNavClick} />
           )}
           {connection && (
             <>
-              <NavBtn id="nl_sql"    icon={<TerminalSquare />} label="NL → SQL"          active={activeTab} set={setActiveTab} />
-              <NavBtn id="teach"     icon={<BookOpen />}       label="Database Tutor"    active={activeTab} set={setActiveTab} />
-              <NavBtn id="optimize"  icon={<Zap />}            label="Query Optimizer"   active={activeTab} set={setActiveTab} />
-              <NavBtn id="schema"    icon={<BarChart3 />}      label="Schema Analysis"   active={activeTab} set={setActiveTab} />
+              <NavBtn id="nl_sql"    icon={<TerminalSquare />} label="NL → SQL"          active={activeTab} set={handleNavClick} />
+              <NavBtn id="teach"     icon={<BookOpen />}       label="Database Tutor"    active={activeTab} set={handleNavClick} />
+              <NavBtn id="optimize"  icon={<Zap />}            label="Query Optimizer"   active={activeTab} set={handleNavClick} />
+              <NavBtn id="schema"    icon={<BarChart3 />}      label="Schema Analysis"   active={activeTab} set={handleNavClick} />
             </>
           )}
           <div style={{ margin: '0.5rem 0', borderTop: '1px solid var(--border-color)' }}></div>
-          <NavBtn id="playground" icon={<Gamepad2 />}      label="SQL Playground"    active={activeTab} set={setActiveTab} />
-          <NavBtn id="developer"  icon={<User />}          label="Developer"         active={activeTab} set={setActiveTab} />
+          <NavBtn id="playground" icon={<Gamepad2 />}      label="SQL Playground"    active={activeTab} set={handleNavClick} />
+          <NavBtn id="developer"  icon={<User />}          label="Developer"         active={activeTab} set={handleNavClick} />
         </nav>
 
         <div className="sidebar-spacer" />
@@ -109,35 +157,50 @@ export default function App() {
 
       {/* ── Main Content ── */}
       <main className="main-content">
-        {activeTab === 'playground' ? (
-          <PlaygroundSection />
-        ) : activeTab === 'developer' ? (
-          <DeveloperSection />
-        ) : !connection ? (
-          <ConnectScreen
-            dbConfig={dbConfig}
-            setField={setField}
-            setDbConfig={setDbConfig}
-            handleDialectChange={handleDialectChange}
-            handleConnect={handleConnect}
-            connecting={connecting}
-            connError={connError}
-          />
-        ) : (
-          <>
-            {activeTab === 'nl_sql'   && <NLSqlSection   connection={connection} sessionId={sessionId} />}
-            {activeTab === 'teach'    && <TeachSection sessionId={sessionId} />}
-            {activeTab === 'optimize' && <OptimizeSection connection={connection} sessionId={sessionId} />}
-            {activeTab === 'schema'   && <SchemaSection  connection={connection} />}
-          </>
-        )}
+        <ErrorBoundary>
+          <div style={{ display: activeTab === 'playground' ? 'block' : 'none', height: '100%' }}>
+            <PlaygroundSection />
+          </div>
+          <div style={{ display: activeTab === 'developer' ? 'block' : 'none', height: '100%' }}>
+            <DeveloperSection />
+          </div>
+          
+          <div style={{ display: (!connection && activeTab !== 'playground' && activeTab !== 'developer') ? 'block' : 'none', height: '100%' }}>
+            <ConnectScreen
+              dbConfig={dbConfig}
+              setField={setField}
+              setDbConfig={setDbConfig}
+              handleDialectChange={handleDialectChange}
+              handleConnect={handleConnect}
+              connecting={connecting}
+              connError={connError}
+            />
+          </div>
+
+          {connection && (
+            <>
+              <div style={{ display: activeTab === 'nl_sql' ? 'block' : 'none', height: '100%' }}>
+                <NLSqlSection connection={connection} sessionId={sessionId} />
+              </div>
+              <div style={{ display: activeTab === 'teach' ? 'block' : 'none', height: '100%' }}>
+                <TeachSection sessionId={sessionId} />
+              </div>
+              <div style={{ display: activeTab === 'optimize' ? 'block' : 'none', height: '100%' }}>
+                <OptimizeSection connection={connection} sessionId={sessionId} />
+              </div>
+              <div style={{ display: activeTab === 'schema' ? 'block' : 'none', height: '100%' }}>
+                <SchemaSection connection={connection} />
+              </div>
+            </>
+          )}
+        </ErrorBoundary>
       </main>
     </div>
   );
 }
 
 /* ── Nav Button ── */
-function NavBtn({ id, icon, label, active, set }) {
+const NavBtn = React.memo(function NavBtn({ id, icon, label, active, set }) {
   return (
     <button
       className={`nav-item ${active === id ? 'active' : ''}`}
@@ -147,12 +210,12 @@ function NavBtn({ id, icon, label, active, set }) {
       {label}
     </button>
   );
-}
+});
 
 /* ────────────────────────────────────────────────────────
    Connection Setup Screen (main area)
 ──────────────────────────────────────────────────────── */
-function ConnectScreen({ dbConfig, setField, setDbConfig, handleDialectChange, handleConnect, connecting, connError }) {
+const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, setDbConfig, handleDialectChange, handleConnect, connecting, connError }) {
   const [dbUrl, setDbUrl] = useState('');
 
   const handleUrlParse = (url) => {
@@ -309,12 +372,12 @@ function ConnectScreen({ dbConfig, setField, setDbConfig, handleDialectChange, h
       </form>
     </div>
   );
-}
+});
 
 /* ────────────────────────────────────────────────────────
    1. Natural Language SQL Generation
 ──────────────────────────────────────────────────────── */
-function NLSqlSection({ connection, sessionId }) {
+const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId }) {
   const [question, setQuestion] = useState('');
   const [mode,     setMode]     = useState('fast');
   const [loading,  setLoading]  = useState(false);
@@ -513,12 +576,12 @@ function NLSqlSection({ connection, sessionId }) {
       )}
     </div>
   );
-}
+});
 
 /* ────────────────────────────────────────────────────────
    2. Teaching Section
 ──────────────────────────────────────────────────────── */
-function TeachSection({ sessionId }) {
+const TeachSection = React.memo(function TeachSection({ sessionId }) {
   const [question, setQuestion] = useState('');
   const [loading,  setLoading]  = useState(false);
   const [history,  setHistory]  = useState([]);
@@ -583,12 +646,12 @@ function TeachSection({ sessionId }) {
       </div>
     </div>
   );
-}
+});
 
 /* ────────────────────────────────────────────────────────
    3. Query Optimization
 ──────────────────────────────────────────────────────── */
-function OptimizeSection({ connection }) {
+const OptimizeSection = React.memo(function OptimizeSection({ connection }) {
   const [sql,     setSql]     = useState('');
   const [explain, setExplain] = useState('');
   const [loading, setLoading] = useState(false);
@@ -661,12 +724,12 @@ function OptimizeSection({ connection }) {
       )}
     </div>
   );
-}
+});
 
 /* ────────────────────────────────────────────────────────
    4. Schema Analysis
 ──────────────────────────────────────────────────────── */
-function SchemaSection({ connection }) {
+const SchemaSection = React.memo(function SchemaSection({ connection }) {
   const [loading, setLoading] = useState(false);
   const [result,  setResult]  = useState(null);
 
@@ -748,12 +811,12 @@ function SchemaSection({ connection }) {
       )}
     </div>
   );
-}
+});
 
 /* ────────────────────────────────────────────────────────
    5. Developer Section
 ──────────────────────────────────────────────────────── */
-function DeveloperSection() {
+const DeveloperSection = React.memo(function DeveloperSection() {
   return (
     <div className="glass-card" style={{ maxWidth: '800px', margin: '0 auto', padding: '2rem', height: 'fit-content' }}>
       <div className="header" style={{ marginBottom: '2rem' }}>
@@ -787,4 +850,4 @@ function DeveloperSection() {
       </div>
     </div>
   );
-}
+});

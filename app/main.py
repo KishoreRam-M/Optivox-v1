@@ -34,7 +34,8 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -53,7 +54,7 @@ import litellm
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s (%(filename)s:%(lineno)d): %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("OptiVox")
@@ -84,6 +85,8 @@ async def lifespan(app: FastAPI):
 
     # Start schema drift detection background task
     asyncio.create_task(_drift_loop())
+    # Start rate limit cleaner background task
+    asyncio.create_task(_cleanup_rate_limits())
     yield
     logger.info("OptiVox DB backend shutting down.")
     _executor.shutdown(wait=False)
@@ -148,6 +151,66 @@ def _check_rate_limit(client_ip: str) -> bool:
         return False
     _rate_limits[client_ip].append(now)
     return True
+
+async def _cleanup_rate_limits():
+    """Background task to periodically clean up stale IPs from the rate limit tracker to prevent memory leaks."""
+    while True:
+        await asyncio.sleep(600)  # clean every 10 mins
+        now = time.time()
+        stale_ips = []
+        for ip, times in list(_rate_limits.items()):
+            valid_times = [t for t in times if now - t < RATE_LIMIT_WINDOW]
+            if not valid_times:
+                stale_ips.append(ip)
+            else:
+                _rate_limits[ip] = valid_times
+        for ip in stale_ips:
+            _rate_limits.pop(ip, None)
+
+
+# ── Middleware & Exception Handlers ───────────────────────────────────────
+
+@app.middleware("http")
+async def security_and_logging_middleware(request: Request, call_next):
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.error(f"Unhandled exception: {exc}", exc_info=True)
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error."}
+        )
+    process_time = time.time() - start_time
+    
+    # Security Headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    # Logging
+    logger.info(f"{request.method} {request.url.path} - {response.status_code} - {process_time:.4f}s")
+    return response
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning(f"Validation error on {request.url.path}: {exc.errors()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Invalid request payload.", "errors": exc.errors()},
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code >= 500:
+        logger.error(f"HTTP exception on {request.url.path}: {exc.detail}")
+    else:
+        logger.warning(f"HTTP {exc.status_code} on {request.url.path}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
 
 
 # ── Health check ──────────────────────────────────────────────────────────
