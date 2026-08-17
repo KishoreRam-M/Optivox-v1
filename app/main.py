@@ -1,13 +1,18 @@
 """
 app/main.py
 -----------
-OptiVox DB — Agentic AI Backend
-FastAPI application with:
-  - HTTP endpoints (connect, query, execute, schema, ERD)
-  - WebSocket endpoints (/ws/query, /ws/tutor, /ws/chat)
-  - RAG background embedding after connection
-  - Schema drift detection loop
-  - CORS middleware
+OptiVox DB — Agentic AI Backend (v4.1 — Vercel/Free-Tier Optimized)
+
+Key optimizations for Gemini 2.5 Flash free tier:
+  - User-provided Gemini API key via X-Gemini-API-Key header
+  - Response caching (LRU + TTL) to reduce RPD consumption
+  - Retry + exponential backoff for 429 rate-limit errors
+  - Token-optimized prompts in all LiteLLM calls
+  - Graceful degradation when API key is missing
+  - CORS reads ALLOWED_ORIGINS from env (safe for production)
+  - Configurable paths for LanceDB and Audit DB
+  - asyncio.get_running_loop() throughout (Python 3.10+ compatible)
+  - ws_tutor bug fixed (no asyncio.run inside running loop)
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -34,7 +40,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -43,10 +49,11 @@ from pydantic import BaseModel, Field
 from app.models.auth import ConnectionModel, QueryRequest, ExecuteRequest
 from app.models.query_plan import ValidatedQueryPlan
 from app.database.connector import test_connection, get_engine, _conn_key
-from app.security.secrets import gemini_api_key
 from app.tools.sql_parser import validate_sql_ast
 from app.audit.audit_log import init_audit_db, log_audit_event, classify_severity
 from app.api.playground import router as playground_router
+from app.api.csv_db import router as csv_db_router
+from app.core.cache import get_cache
 
 import litellm
 
@@ -54,7 +61,7 @@ import litellm
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s (%(filename)s:%(lineno)d): %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("OptiVox")
@@ -64,31 +71,94 @@ logger = logging.getLogger("OptiVox")
 _executor = ThreadPoolExecutor(max_workers=4)
 _session_histories: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 _active_connections: List[Dict[str, Any]] = []
-_ws_clients: List[WebSocket] = []  # drift notification subscribers
+_ws_clients: List[WebSocket] = []
 
 MAX_SESSION_HISTORY = 5
 
-# ── Lifespan ──────────────────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────
 
+def _get_allowed_origins() -> List[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "*")
+    return ["*"] if raw == "*" else [o.strip() for o in raw.split(",") if o.strip()]
+
+
+# ── API key helper ────────────────────────────────────────────────────────
+
+def _resolve_api_key(header_key: Optional[str]) -> str:
+    """Return the user-provided key, or fall back to the env var."""
+    return (header_key or "").strip() or os.environ.get("GEMINI_API_KEY", "")
+
+
+def _require_api_key(header_key: Optional[str]) -> str:
+    """Resolve key and raise 401 if neither source has one."""
+    key = _resolve_api_key(header_key)
+    if not key:
+        raise HTTPException(
+            status_code=401,
+            detail="No Gemini API key provided. Pass your key in the X-Gemini-API-Key header.",
+        )
+    return key
+
+
+# ── LiteLLM call with retry ───────────────────────────────────────────────
+
+def _litellm_call(
+    messages: list,
+    api_key: str,
+    model: str = "gemini/gemini-2.5-flash",
+    stream: bool = False,
+    max_attempts: int = 3,
+    base_delay: float = 4.0,
+):
+    """LiteLLM call with exponential-backoff retry for 429 errors."""
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return litellm.completion(
+                model=model,
+                messages=messages,
+                api_key=api_key,
+                stream=stream,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc).lower()
+            if ("429" in err_str or "quota" in err_str or "rate" in err_str) and attempt < max_attempts - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning("[litellm] Rate limited (attempt %d). Waiting %.1fs", attempt + 1, delay)
+                time.sleep(delay)
+            else:
+                break
+    raise last_exc
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("OptiVox DB backend starting up.")
+    logger.info("OptiVox DB starting up (free-tier optimized).")
     init_audit_db()
-    
-    # Pre-seed dialect docs
+
+    # Pre-seed dialect docs (RAG)
     from app.rag.dialect_seeder import seed_dialect_docs
     try:
         seed_dialect_docs()
     except Exception as e:
-        logger.error(f"Failed to seed dialect docs: {e}")
+        logger.error("Failed to seed dialect docs: %s", e)
 
-    # Start schema drift detection background task
+    # Pre-warm LangGraph pipeline
+    try:
+        from app.agents.graph import get_graph
+        get_graph()
+        logger.info("LangGraph pipeline ready.")
+    except Exception as e:
+        logger.error("LangGraph warm-up failed: %s", e)
+
     asyncio.create_task(_drift_loop())
-    # Start rate limit cleaner background task
     asyncio.create_task(_cleanup_rate_limits())
     yield
-    logger.info("OptiVox DB backend shutting down.")
+    logger.info("OptiVox DB shutting down.")
     _executor.shutdown(wait=False)
 
 
@@ -96,12 +166,8 @@ async def _drift_loop():
     from app.rag.drift_detector import drift_detection_loop
 
     async def notify_clients(conn_key: str, changed_tables: List[str]):
-        msg = json.dumps({
-            "type": "schema_drift",
-            "connection": conn_key,
-            "changed_tables": changed_tables,
-        })
-        for ws in _ws_clients:
+        msg = json.dumps({"type": "schema_drift", "connection": conn_key, "changed_tables": changed_tables})
+        for ws in list(_ws_clients):
             try:
                 await ws.send_text(msg)
             except Exception:
@@ -121,21 +187,21 @@ async def _drift_loop():
 
 app = FastAPI(
     title="OptiVox DB — Agentic AI",
-    description="Natural language to SQL with autonomous CrewAI agents.",
-    version="4.0.0",
+    description="NL→SQL with LangGraph agents. Optimized for Gemini 2.5 Flash free tier.",
+    version="4.1.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Gemini-API-Key"],
 )
 
-# ── Sub-routers ───────────────────────────────────────────────────────────
 app.include_router(playground_router)
+app.include_router(csv_db_router)
 
 # ── Rate limiting ─────────────────────────────────────────────────────────
 
@@ -152,96 +218,75 @@ def _check_rate_limit(client_ip: str) -> bool:
     _rate_limits[client_ip].append(now)
     return True
 
+
 async def _cleanup_rate_limits():
-    """Background task to periodically clean up stale IPs from the rate limit tracker to prevent memory leaks."""
     while True:
-        await asyncio.sleep(600)  # clean every 10 mins
+        await asyncio.sleep(600)
         now = time.time()
-        stale_ips = []
-        for ip, times in list(_rate_limits.items()):
-            valid_times = [t for t in times if now - t < RATE_LIMIT_WINDOW]
-            if not valid_times:
-                stale_ips.append(ip)
-            else:
-                _rate_limits[ip] = valid_times
-        for ip in stale_ips:
+        stale = [ip for ip, times in _rate_limits.items() if not [t for t in times if now - t < RATE_LIMIT_WINDOW]]
+        for ip in stale:
             _rate_limits.pop(ip, None)
 
 
-# ── Middleware & Exception Handlers ───────────────────────────────────────
+# ── Middleware ────────────────────────────────────────────────────────────
 
 @app.middleware("http")
 async def security_and_logging_middleware(request: Request, call_next):
-    start_time = time.time()
+    start = time.time()
     try:
         response = await call_next(request)
     except Exception as exc:
-        logger.error(f"Unhandled exception: {exc}", exc_info=True)
-        response = JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error."}
-        )
-    process_time = time.time() - start_time
-    
-    # Security Headers
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    
-    # Logging
-    logger.info(f"{request.method} {request.url.path} - {response.status_code} - {process_time:.4f}s")
+        logger.error("Unhandled: %s", exc, exc_info=True)
+        response = JSONResponse(status_code=500, content={"detail": "Internal server error."})
+    response.headers.update({
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "X-XSS-Protection": "1; mode=block",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    })
+    logger.info("%s %s → %d (%.3fs)", request.method, request.url.path, response.status_code, time.time() - start)
     return response
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.warning(f"Validation error on {request.url.path}: {exc.errors()}")
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": "Invalid request payload.", "errors": exc.errors()},
     )
 
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    if exc.status_code >= 500:
-        logger.error(f"HTTP exception on {request.url.path}: {exc.detail}")
-    else:
-        logger.warning(f"HTTP {exc.status_code} on {request.url.path}: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-# ── Health check ──────────────────────────────────────────────────────────
-
+# ── Health ────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 async def health():
-    return {"status": "ok", "version": "4.0.0", "timestamp": datetime.now(timezone.utc).isoformat()}
+    cache = get_cache()
+    return {
+        "status": "ok",
+        "version": "4.1.0",
+        "model": "gemini-2.5-flash",
+        "cache_size": cache.size(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-# ── Database connect endpoint ─────────────────────────────────────────────
-
+# ── Database connect ──────────────────────────────────────────────────────
 
 @app.post("/api/connect", tags=["Database"])
 async def connect_database(conn: ConnectionModel, background_tasks: BackgroundTasks):
-    """
-    Test database connection and trigger async schema embedding.
-    Returns detected dialect and connection status.
-    """
+    """Test connection and trigger background schema embedding."""
     try:
         info = test_connection(conn.model_dump())
         conn_dict = conn.model_dump()
-
-        # Register active connection for drift detection
         key = _conn_key(conn_dict)
         if not any(_conn_key(c) == key for c in _active_connections):
             _active_connections.append(conn_dict)
-
-        # Background schema embedding
         background_tasks.add_task(_embed_schema_bg, conn_dict)
-
         return {"status": "connected", "info": info}
     except Exception as exc:
         logger.error("Connection failed: %s", exc)
@@ -249,41 +294,36 @@ async def connect_database(conn: ConnectionModel, background_tasks: BackgroundTa
 
 
 async def _embed_schema_bg(conn: Dict[str, Any]):
-    """Background task: extract schema DDLs and embed into LanceDB."""
     try:
         from app.database.schema_extractor import extract_schema
         from app.rag.embedder import embed_schema
-
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         engine = await loop.run_in_executor(_executor, lambda: get_engine(conn))
-        tables = await loop.run_in_executor(
-            _executor, lambda: extract_schema(engine, conn.get("dialect", "mysql"))
-        )
+        tables = await loop.run_in_executor(_executor, lambda: extract_schema(engine, conn.get("dialect", "mysql")))
         conn_key = _conn_key(conn)
         await loop.run_in_executor(_executor, lambda: embed_schema(tables, conn_key))
-        logger.info("Schema embedded for %s (%d tables).", conn_key, len(tables))
+        logger.info("Schema embedded: %s (%d tables)", conn_key, len(tables))
     except Exception as exc:
         logger.error("Schema embedding failed: %s", exc)
 
 
-# ── NL-to-SQL endpoint (Phase 1 — single LLM call) ───────────────────────
-
+# ── NL-to-SQL (fast single call) ─────────────────────────────────────────
 
 @app.post("/api/query", tags=["Query"])
-async def generate_query(req: QueryRequest, request: Request):
-    """
-    Phase 1: Generate SQL from natural language using LiteLLM + Gemini.
-    Phase 3 upgrades this to use the full CrewAI Crew.
-    """
+async def generate_query(
+    req: QueryRequest,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    """Fast SQL generation — single LiteLLM call. Uses cache for duplicate questions."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
-    # Pull session history
+    api_key = _require_api_key(x_gemini_api_key)
     session_id = req.session_id or "default"
     history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
 
-    # Retrieve schema context via RAG
     try:
         from app.rag.embedder import fetch_schema_context, fetch_query_history
         schema_context = fetch_schema_context(req.question)
@@ -291,141 +331,129 @@ async def generate_query(req: QueryRequest, request: Request):
     except Exception:
         schema_context, few_shot = "", ""
 
-    history_str = json.dumps(history) if history else "No previous history."
-    few_shot_str = f"\n\nFew-shot examples from history:\n{few_shot}" if few_shot else ""
+    history_str = json.dumps(history[-3:]) if history else "None"
+    prompt = f"""Generate a {req.dialect.upper()} SQL query.
 
-    prompt = f"""You are an expert SQL developer. Generate a single valid {req.dialect.upper()} SQL query.
+Request: {req.question}
+Schema: {schema_context or "No schema — use best judgment."}
+{f"Examples:{chr(10)}{few_shot}" if few_shot else ""}
+History: {history_str}
 
-User request: {req.question}
+Return ONLY the SQL. No markdown. No explanation."""
 
-Relevant schema (from vector search):
-{schema_context or "No schema context available — use your best judgment."}
-{few_shot_str}
+    # Check cache first
+    cache = get_cache()
+    cached = cache.get(prompt)
+    if cached:
+        logger.info("[/api/query] Cache hit")
+        sql = cached
+    else:
+        try:
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                _executor,
+                lambda: _litellm_call([{"role": "user", "content": prompt}], api_key),
+            )
+            sql = response.choices[0].message.content.strip()
+            sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"```", "", sql).strip()
+            cache.set(prompt, sql)
+        except Exception as exc:
+            logger.error("/api/query failed: %s", traceback.format_exc())
+            raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
-Conversation history: {history_str}
-
-Rules:
-- Return ONLY the SQL statement. No explanations, no markdown fences.
-- Use only table and column names that appear in the schema context.
-- Be dialect-aware: use {req.dialect.upper()} syntax.
-"""
-
-    try:
-        api_key = gemini_api_key()
-        response = await asyncio.get_event_loop().run_in_executor(
-            _executor,
-            lambda: litellm.completion(
-                model="gemini/gemini-2.5-flash",
-                messages=[{"role": "user", "content": prompt}],
-                api_key=api_key,
-            ),
-        )
-        sql = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
-        sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"```", "", sql).strip()
-
-        # Safety check
-        is_safe, reason = validate_sql_ast(sql, req.dialect)
-
-        return {
-            "sql": sql,
-            "dialect": req.dialect,
-            "safe": is_safe,
-            "safety_reason": reason,
-            "session_id": session_id,
-        }
-    except Exception as exc:
-        logger.error("LLM query generation failed: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(exc))
+    is_safe, reason = validate_sql_ast(sql, req.dialect)
+    return {"sql": sql, "dialect": req.dialect, "safe": is_safe, "safety_reason": reason, "session_id": session_id}
 
 
-# ── Agentic query endpoint (Phase 3 — CrewAI) ────────────────────────────
+def _friendly_error(exc: Exception) -> str:
+    """Convert LLM errors to user-friendly messages."""
+    msg = str(exc).lower()
+    if "429" in msg or "quota" in msg or "rate" in msg:
+        return "Gemini free tier rate limit reached. Please wait 60 seconds and try again."
+    if "401" in msg or "api_key" in msg or "invalid" in msg:
+        return "Invalid Gemini API key. Please check your key in Settings."
+    if "timeout" in msg:
+        return "Request timed out. Please try again."
+    return "AI service error. Please try again in a moment."
 
 
-@app.post("/api/query/crew", tags=["Query"])
-async def generate_query_crew(req: QueryRequest, request: Request):
-    """
-    Phase 3: Full CrewAI pipeline — Architect → Generator → Reviewer.
-    Use this endpoint once CrewAI is fully configured.
-    """
+# ── Agentic query (LangGraph) ─────────────────────────────────────────────
+
+@app.post("/api/query/agent", tags=["Query"])
+async def generate_query_agent(
+    req: QueryRequest,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    """Full LangGraph pipeline — Architect → Generator → Reviewer with self-healing."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
+    api_key = _require_api_key(x_gemini_api_key)
     session_id = req.session_id or "default"
     history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
-    history_str = json.dumps(history) if history else "None"
+    history_str = json.dumps(history[-3:]) if history else "None"
 
     try:
-        from app.agents.hierarchical_crew import run_hierarchical_query
-        loop = asyncio.get_event_loop()
+        from app.agents.graph import run_agent_pipeline
+        loop = asyncio.get_running_loop()
         plan: ValidatedQueryPlan = await asyncio.wait_for(
             loop.run_in_executor(
                 _executor,
-                lambda: run_hierarchical_query(req.question, req.dialect, history_str),
+                lambda: run_agent_pipeline(req.question, req.dialect, history_str, api_key),
             ),
             timeout=120.0,
         )
-
-        _session_histories[session_id].append({
-            "role": "user", "content": req.question, "sql": plan.sql,
-        })
-
+        _session_histories[session_id].append({"role": "user", "content": req.question, "sql": plan.sql})
         return plan.model_dump()
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="Crew pipeline timed out.")
+        raise HTTPException(status_code=408, detail="Agent pipeline timed out (120s). Try fast mode.")
     except Exception as exc:
-        logger.error("CrewAI pipeline failed: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.error("/api/query/agent failed: %s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
-# ── Execute endpoint ──────────────────────────────────────────────────────
+# Backward-compat alias
+@app.post("/api/query/crew", tags=["Query"], include_in_schema=False)
+async def generate_query_crew_compat(
+    req: QueryRequest,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    return await generate_query_agent(req, request, x_gemini_api_key)
 
+
+# ── Execute ───────────────────────────────────────────────────────────────
 
 @app.post("/api/execute", tags=["Query"])
 async def execute_query(req: ExecuteRequest, request: Request):
-    """
-    Execute a validated SQL string against the connected database.
-    Returns columns and rows as JSON.
-    """
+    """Execute validated SQL against the connected database."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
-    # Safety validation
     is_safe, safety_reason = validate_sql_ast(req.sql, req.connection.dialect)
-    
-    # Audit logging for DANGER queries
     severity = classify_severity(req.sql)
     if severity == "DANGER":
         log_audit_event(
             session_id=req.session_id or "default",
-            severity=severity,
-            sql_text=req.sql,
-            dialect=req.connection.dialect,
-            host=req.connection.host,
-            database=req.connection.database,
-            approved=is_safe
+            severity=severity, sql_text=req.sql, dialect=req.connection.dialect,
+            host=req.connection.host, database=req.connection.database, approved=is_safe,
         )
-
     if not is_safe:
         raise HTTPException(status_code=400, detail=f"Unsafe SQL: {safety_reason}")
 
     try:
         from sqlalchemy import text as sa_text
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _run():
             engine = get_engine(req.connection.model_dump())
             start = time.time()
-
-            # Split into individual statements, skip empty ones
             statements = [s.strip() for s in req.sql.split(';') if s.strip()]
-            last_result = None
-            total_rows_affected = 0
-            executed = 0
-
+            last_result, total_rows_affected, executed = None, 0, 0
             with engine.connect() as conn:
                 for stmt in statements:
                     result = conn.execute(sa_text(stmt))
@@ -437,77 +465,60 @@ async def execute_query(req: ExecuteRequest, request: Request):
                     else:
                         total_rows_affected += result.rowcount if result.rowcount != -1 else 0
                 conn.commit()
-
             duration_ms = int((time.time() - start) * 1000)
             if last_result:
                 return {**last_result, "duration_ms": duration_ms, "statements_executed": executed}
-            return {
-                "columns": [], "rows": [],
-                "rows_affected": total_rows_affected,
-                "duration_ms": duration_ms,
-                "statements_executed": executed,
-            }
+            return {"columns": [], "rows": [], "rows_affected": total_rows_affected, "duration_ms": duration_ms, "statements_executed": executed}
 
         data = await loop.run_in_executor(_executor, _run)
-
-        # Embed successful query into history
         session_id = req.session_id or "default"
         try:
             from app.rag.embedder import embed_query_history
-            await loop.run_in_executor(
-                _executor,
-                lambda: embed_query_history(req.sql, req.sql, session_id),
-            )
+            await loop.run_in_executor(_executor, lambda: embed_query_history(req.sql, req.sql, session_id))
         except Exception:
             pass
-
         return {"status": "success", **data}
     except Exception as exc:
-        logger.error("Execution failed: %s", exc)
+        logger.error("Execute failed: %s", exc)
         raise HTTPException(status_code=400, detail=f"Query execution failed: {str(exc)}")
 
 
 # ── Schema endpoint ───────────────────────────────────────────────────────
 
-
 @app.post("/api/schema", tags=["Database"])
 async def get_schema(conn: ConnectionModel):
-    """Extract and return the full schema of the connected database."""
     try:
         from app.database.schema_extractor import extract_schema
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         engine = await loop.run_in_executor(_executor, lambda: get_engine(conn.model_dump()))
-        tables = await loop.run_in_executor(
-            _executor, lambda: extract_schema(engine, conn.dialect)
-        )
+        tables = await loop.run_in_executor(_executor, lambda: extract_schema(engine, conn.dialect))
         return {"status": "ok", "tables": tables, "table_count": len(tables)}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-# ── ADIA: Natural Language SQL Generation ────────────────────────────────
-
+# ── ADIA: NL→SQL ──────────────────────────────────────────────────────────
 
 class ADIANLRequest(BaseModel):
-    """Request for NL→SQL generation."""
     question: str
-    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle)$")
-    connection: Optional[Any] = None  # ConnectionModel forwarded for context
+    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle|mssql)$")
+    connection: Optional[Any] = None
     session_id: Optional[str] = None
-    mode: str = Field("fast", pattern="^(fast|crew)$")  # fast=single LLM, crew=CrewAI
+    mode: str = Field("fast", pattern="^(fast|agent)$")
 
 
 @app.post("/api/adia/nl-sql", tags=["ADIA"])
-async def adia_nl_sql(req: ADIANLRequest, request: Request):
-    """
-    ADIA Section 1 — Natural Language SQL Generation.
-    Converts a plain-English question into a validated SQL query.
-    Mode: 'fast' uses a single LLM call; 'crew' runs the full CrewAI pipeline.
-    """
+async def adia_nl_sql(
+    req: ADIANLRequest,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    """NL→SQL. mode=fast (1 LLM call) or mode=agent (LangGraph pipeline)."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
+    api_key = _require_api_key(x_gemini_api_key)
     session_id = req.session_id or "default"
     history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
 
@@ -518,78 +529,66 @@ async def adia_nl_sql(req: ADIANLRequest, request: Request):
     except Exception:
         schema_context, few_shot = "", ""
 
-    if req.mode == "crew":
-        history_str = json.dumps(history) if history else "None"
+    if req.mode == "agent":
+        history_str = json.dumps(history[-3:]) if history else "None"
         try:
-            from app.agents.hierarchical_crew import run_hierarchical_query
-            loop = asyncio.get_event_loop()
+            from app.agents.graph import run_agent_pipeline
+            loop = asyncio.get_running_loop()
             plan: ValidatedQueryPlan = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _executor,
-                    lambda: run_hierarchical_query(req.question, req.dialect, history_str),
-                ),
+                loop.run_in_executor(_executor, lambda: run_agent_pipeline(req.question, req.dialect, history_str, api_key)),
                 timeout=120.0,
             )
             _session_histories[session_id].append({"role": "user", "content": req.question, "sql": plan.sql})
             return {
-                "section": "nl_sql",
-                "mode": "crew",
-                "sql": plan.sql,
-                "dialect": plan.dialect,
-                "approved": plan.approved,
-                "is_destructive": plan.is_destructive,
-                "rejection_reason": plan.rejection_reason,
-                "session_id": session_id,
+                "section": "nl_sql", "mode": "agent",
+                "sql": plan.sql, "dialect": plan.dialect,
+                "approved": plan.approved, "is_destructive": plan.is_destructive,
+                "rejection_reason": plan.rejection_reason, "session_id": session_id,
             }
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail="Agent pipeline timed out.")
         except Exception as exc:
-            logger.error("ADIA NL-SQL crew failed: %s", traceback.format_exc())
-            raise HTTPException(status_code=500, detail="SQL generation failed. Please try again.")
+            logger.error("ADIA NL-SQL agent failed: %s", traceback.format_exc())
+            raise HTTPException(status_code=500, detail=_friendly_error(exc))
     else:
-        # Fast mode — single LLM call
-        history_str = json.dumps(history) if history else "No previous history."
-        few_shot_str = f"\n\nFew-shot examples:\n{few_shot}" if few_shot else ""
-        prompt = f"""You are an expert SQL developer. Generate a single valid {req.dialect.upper()} SQL query.
+        # Fast mode
+        history_str = json.dumps(history[-3:]) if history else "None"
+        prompt = f"""Generate a {req.dialect.upper()} SQL query.
 
-User request: {req.question}
-Relevant schema:
-{schema_context or "No schema — use best judgment."}
-{few_shot_str}
-Conversation history: {history_str}
+Request: {req.question}
+Schema: {schema_context or "No schema."}
+{f"Examples:{chr(10)}{few_shot}" if few_shot else ""}
+History: {history_str}
 
-Rules: Return ONLY the SQL. No markdown. No explanation. Dialect: {req.dialect.upper()}."""
-        try:
-            api_key = gemini_api_key()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: litellm.completion(
-                    model="gemini/gemini-2.5-flash",
-                    messages=[{"role": "user", "content": prompt}],
-                    api_key=api_key,
-                ),
-            )
-            sql = response.choices[0].message.content.strip()
-            sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
-            sql = re.sub(r"```", "", sql).strip()
-            is_safe, safety_reason = validate_sql_ast(sql, req.dialect)
-            _session_histories[session_id].append({"role": "user", "content": req.question, "sql": sql})
-            return {
-                "section": "nl_sql",
-                "mode": "fast",
-                "sql": sql,
-                "dialect": req.dialect,
-                "safe": is_safe,
-                "safety_reason": safety_reason,
-                "session_id": session_id,
-            }
-        except Exception as exc:
-            logger.error("ADIA NL-SQL fast failed: %s", traceback.format_exc())
-            raise HTTPException(status_code=500, detail="SQL generation failed. Please try again.")
+Return ONLY the SQL. No markdown."""
+        cache = get_cache()
+        cached = cache.get(prompt)
+        if cached:
+            sql = cached
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+                resp = await loop.run_in_executor(
+                    _executor,
+                    lambda: _litellm_call([{"role": "user", "content": prompt}], api_key),
+                )
+                sql = resp.choices[0].message.content.strip()
+                sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+                sql = re.sub(r"```", "", sql).strip()
+                cache.set(prompt, sql)
+            except Exception as exc:
+                logger.error("ADIA NL-SQL fast failed: %s", traceback.format_exc())
+                raise HTTPException(status_code=500, detail=_friendly_error(exc))
+        is_safe, safety_reason = validate_sql_ast(sql, req.dialect)
+        _session_histories[session_id].append({"role": "user", "content": req.question, "sql": sql})
+        return {
+            "section": "nl_sql", "mode": "fast",
+            "sql": sql, "dialect": req.dialect,
+            "safe": is_safe, "safety_reason": safety_reason, "session_id": session_id,
+        }
 
 
-# ── ADIA: Teaching ────────────────────────────────────────────────────────
-
+# ── ADIA: Teach ───────────────────────────────────────────────────────────
 
 class ADIATeachRequest(BaseModel):
     question: str
@@ -597,28 +596,29 @@ class ADIATeachRequest(BaseModel):
 
 
 @app.post("/api/adia/teach", tags=["ADIA"])
-async def adia_teach(req: ADIATeachRequest, request: Request):
-    """
-    ADIA Section 2 — Teaching.
-    Returns a structured SQL/database lesson with examples for the given topic.
-    """
+async def adia_teach(
+    req: ADIATeachRequest,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    """Database tutor — structured SQL lesson with examples."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
+    api_key = _require_api_key(x_gemini_api_key)
     session_id = req.session_id or "default"
-    history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
+    history = _session_histories[session_id][-3:]  # reduced to 3 for token efficiency
+
+    # Check cache for identical questions
+    cache = get_cache()
+    cache_key = f"teach:{req.question}"
+    cached = cache.get(cache_key)
+    if cached and not history:
+        return {"section": "teach", "answer": cached, "session_id": session_id, "cached": True}
 
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert database educator. "
-                "Respond with a concise, numbered lesson (max 5 points). "
-                "Include at least one concrete SQL example per concept. "
-                "Be precise and pedagogically progressive. No preamble."
-            ),
-        }
+        {"role": "system", "content": "You are a SQL expert educator. Give concise numbered lessons (max 4 points) with SQL examples. Be direct — no preamble."},
     ]
     for h in history:
         if h.get("role") and h.get("content"):
@@ -626,69 +626,63 @@ async def adia_teach(req: ADIATeachRequest, request: Request):
     messages.append({"role": "user", "content": req.question})
 
     try:
-        api_key = gemini_api_key()
-        response = await asyncio.get_event_loop().run_in_executor(
-            _executor,
-            lambda: litellm.completion(
-                model="gemini/gemini-2.5-flash",
-                messages=messages,
-                api_key=api_key,
-            ),
-        )
-        answer = response.choices[0].message.content.strip()
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(_executor, lambda: _litellm_call(messages, api_key))
+        answer = resp.choices[0].message.content.strip()
+        if not history:
+            cache.set(cache_key, answer)
         _session_histories[session_id].append({"role": "assistant", "content": answer})
         return {"section": "teach", "answer": answer, "session_id": session_id}
     except Exception as exc:
         logger.error("ADIA teach failed: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Teaching response failed. Please try again.")
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
-# ── ADIA: Query Optimization ─────────────────────────────────────────────
-
+# ── ADIA: Optimize ────────────────────────────────────────────────────────
 
 class ADIAOptimizeRequest(BaseModel):
     sql: str
-    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle)$")
-    explain_output: Optional[str] = None  # Optional EXPLAIN plan text
+    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle|mssql)$")
+    explain_output: Optional[str] = None
     session_id: Optional[str] = None
 
 
 @app.post("/api/adia/optimize", tags=["ADIA"])
-async def adia_optimize(req: ADIAOptimizeRequest, request: Request):
-    """
-    ADIA Section 3 — Query Optimization.
-    Analyzes a SQL query (and optional EXPLAIN output) and returns
-    structured performance tips and rewrite suggestions.
-    """
+async def adia_optimize(
+    req: ADIAOptimizeRequest,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    """Query optimizer — returns structured performance analysis as JSON."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
-    explain_ctx = f"\n\nEXPLAIN output:\n{req.explain_output}" if req.explain_output else ""
-    prompt = f"""You are a database performance specialist. Analyze this {req.dialect.upper()} SQL query and return ONLY a JSON object with these exact keys:
-- "issues": list of {{"type": str, "description": str}} — identified performance problems
-- "rewritten_sql": str — optimized version of the query (or same if already optimal)
-- "tips": list of str — concise actionable performance tips (max 5)
-- "index_suggestions": list of {{"table": str, "column": str, "reason": str}}
+    api_key = _require_api_key(x_gemini_api_key)
 
-SQL:\n{req.sql}{explain_ctx}
+    explain_ctx = f"\nEXPLAIN output:\n{req.explain_output}" if req.explain_output else ""
+    prompt = f"""Analyze this {req.dialect.upper()} SQL and return ONLY a JSON object:
+{{"issues":[{{"type":"...","description":"..."}}],"rewritten_sql":"...","tips":["..."],"index_suggestions":[{{"table":"...","column":"...","reason":"..."}}]}}
 
-Return valid JSON only. No markdown. No explanation outside the JSON."""
+SQL: {req.sql}{explain_ctx}
+
+JSON only. No markdown."""
+
+    cache = get_cache()
+    cached = cache.get(prompt)
+    if cached:
+        try:
+            return {"section": "optimize", "dialect": req.dialect, **json.loads(cached)}
+        except Exception:
+            pass
 
     try:
-        api_key = gemini_api_key()
-        response = await asyncio.get_event_loop().run_in_executor(
-            _executor,
-            lambda: litellm.completion(
-                model="gemini/gemini-2.5-flash",
-                messages=[{"role": "user", "content": prompt}],
-                api_key=api_key,
-            ),
-        )
-        raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(_executor, lambda: _litellm_call([{"role": "user", "content": prompt}], api_key))
+        raw = resp.choices[0].message.content.strip()
         raw = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"```", "", raw).strip()
+        cache.set(prompt, raw)
         try:
             analysis = json.loads(raw)
         except json.JSONDecodeError:
@@ -696,64 +690,45 @@ Return valid JSON only. No markdown. No explanation outside the JSON."""
         return {"section": "optimize", "dialect": req.dialect, **analysis}
     except Exception as exc:
         logger.error("ADIA optimize failed: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Optimization analysis failed. Please try again.")
+        raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
 
-# ── ADIA: Schema Analysis & Optimization ─────────────────────────────────
-
-
-class ADIASchemaAnalysisRequest(BaseModel):
-    connection: Any  # ConnectionModel
-
+# ── ADIA: Schema Analysis ─────────────────────────────────────────────────
 
 @app.post("/api/adia/schema-analysis", tags=["ADIA"])
-async def adia_schema_analysis(conn: ConnectionModel, request: Request):
-    """
-    ADIA Section 4 — Schema Analysis & Optimization.
-    Returns actionable insights, performance tips, FK maps, missing indexes,
-    isolated tables, and AI-generated recommendations.
-    """
+async def adia_schema_analysis(
+    conn: ConnectionModel,
+    request: Request,
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    """Schema analysis with AI-generated DBA recommendations."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
 
+    api_key = _require_api_key(x_gemini_api_key)
+
     try:
         from app.database.schema_extractor import extract_schema
         from app.api.schema_analysis import analyze_schema
-
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         engine = await loop.run_in_executor(_executor, lambda: get_engine(conn.model_dump()))
-        tables = await loop.run_in_executor(
-            _executor, lambda: extract_schema(engine, conn.dialect)
-        )
-        analysis = await loop.run_in_executor(
-            _executor, lambda: analyze_schema(tables, engine)
-        )
+        tables = await loop.run_in_executor(_executor, lambda: extract_schema(engine, conn.dialect))
+        analysis = await loop.run_in_executor(_executor, lambda: analyze_schema(tables, engine))
 
-        # AI-generated recommendations
         issues_summary = ""
         if analysis.get("missing_index_suggestions"):
-            issues_summary = "Missing indexes: " + "; ".join(
-                f"{s['table']}.{s['column']}" for s in analysis["missing_index_suggestions"][:5]
-            )
+            issues_summary = "Missing indexes: " + "; ".join(f"{s['table']}.{s['column']}" for s in analysis["missing_index_suggestions"][:5])
         if analysis.get("isolated_tables"):
-            issues_summary += " | Isolated tables: " + ", ".join(analysis["isolated_tables"][:5])
+            issues_summary += " | Isolated: " + ", ".join(analysis["isolated_tables"][:5])
 
         recommendations: List[str] = []
         if issues_summary:
             try:
-                api_key = gemini_api_key()
-                rec_prompt = (
-                    f"Database schema has these issues: {issues_summary}\n"
-                    "List 3 concise, actionable DBA recommendations. Return as a JSON array of strings only."
-                )
+                rec_prompt = f"DB has issues: {issues_summary}\nGive 3 DBA recommendations. Return JSON array of strings only."
                 rec_resp = await loop.run_in_executor(
                     _executor,
-                    lambda: litellm.completion(
-                        model="gemini/gemini-2.5-flash",
-                        messages=[{"role": "user", "content": rec_prompt}],
-                        api_key=api_key,
-                    ),
+                    lambda: _litellm_call([{"role": "user", "content": rec_prompt}], api_key),
                 )
                 raw_rec = rec_resp.choices[0].message.content.strip()
                 raw_rec = re.sub(r"```(?:json)?\s*", "", raw_rec, flags=re.IGNORECASE)
@@ -763,31 +738,26 @@ async def adia_schema_analysis(conn: ConnectionModel, request: Request):
                 recommendations = []
 
         return {
-            "section": "schema_analysis",
-            "status": "ok",
+            "section": "schema_analysis", "status": "ok",
             **analysis,
             "ai_recommendations": recommendations,
             "performance_tips": [
-                "Add indexes on all foreign key columns to avoid full table scans on JOINs.",
-                "Every table should have a primary key for efficient index lookups.",
-                "Isolated tables with no relationships may indicate orphaned data — review.",
-                "Consider partitioning large tables (>10M rows) on frequently filtered columns.",
+                "Add indexes on all foreign key columns.",
+                "Every table needs a primary key.",
+                "Isolated tables may indicate orphaned data — review.",
+                "Partition large tables (>10M rows) on filtered columns.",
             ],
         }
     except Exception as exc:
-        logger.error("ADIA schema-analysis failed: %s", exc)
-        raise HTTPException(status_code=400, detail="Schema analysis failed. Verify your connection and try again.")
+        logger.error("Schema analysis failed: %s", exc)
+        raise HTTPException(status_code=400, detail="Schema analysis failed. Verify your connection.")
 
 
-# ── WebSocket — query streaming ───────────────────────────────────────────
-
+# ── WebSocket: query streaming ────────────────────────────────────────────
 
 @app.websocket("/ws/query")
 async def ws_query(websocket: WebSocket):
-    """
-    WebSocket endpoint for live agent status streaming.
-    Accepts QueryRequest JSON, streams status messages, returns final ValidatedQueryPlan.
-    """
+    """WebSocket: stream agent status updates and return final SQL plan."""
     await websocket.accept()
     _ws_clients.append(websocket)
     try:
@@ -795,56 +765,46 @@ async def ws_query(websocket: WebSocket):
             data = await websocket.receive_text()
             payload = json.loads(data)
             req = QueryRequest(**payload)
+            api_key = _resolve_api_key(payload.get("api_key", ""))
+            if not api_key:
+                await websocket.send_text(json.dumps({"status": "error", "message": "No API key provided."}))
+                continue
+
             session_id = req.session_id or "default"
             history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
-            history_str = json.dumps(history) if history else "None"
+            history_str = json.dumps(history[-3:]) if history else "None"
 
-            async def send(msg: str, status: str = "progress"):
-                await websocket.send_text(json.dumps({"status": status, "message": msg}))
+            async def send(msg: str, s: str = "progress"):
+                await websocket.send_text(json.dumps({"status": s, "message": msg}))
 
             await send("Architect is analyzing your request…", "architect")
-
-            def _step_cb(step):
-                pass  # reserved for future per-step streaming
-
             try:
-                from app.agents.hierarchical_crew import run_hierarchical_query
-                loop = asyncio.get_event_loop()
-
+                from app.agents.graph import run_agent_pipeline
+                loop = asyncio.get_running_loop()
                 await send("Generator is writing SQL…", "generator")
                 plan: ValidatedQueryPlan = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        _executor,
-                        lambda: run_hierarchical_query(req.question, req.dialect, history_str),
-                    ),
+                    loop.run_in_executor(_executor, lambda: run_agent_pipeline(req.question, req.dialect, history_str, api_key)),
                     timeout=120.0,
                 )
                 await send("Reviewer is checking safety…", "reviewer")
-                await asyncio.sleep(0.1)
-
-                _session_histories[session_id].append({
-                    "role": "user", "content": req.question, "sql": plan.sql,
-                })
-
-                await websocket.send_text(json.dumps({
-                    "status": "done",
-                    "plan": plan.model_dump(),
-                }))
+                await asyncio.sleep(0.05)
+                _session_histories[session_id].append({"role": "user", "content": req.question, "sql": plan.sql})
+                await websocket.send_text(json.dumps({"status": "done", "plan": plan.model_dump()}))
             except asyncio.TimeoutError:
-                await websocket.send_text(json.dumps({"status": "error", "message": "Timed out."}))
+                await websocket.send_text(json.dumps({"status": "error", "message": "Timed out (120s). Try fast mode."}))
             except Exception as exc:
-                await websocket.send_text(json.dumps({"status": "error", "message": str(exc)}))
+                await websocket.send_text(json.dumps({"status": "error", "message": _friendly_error(exc)}))
 
     except WebSocketDisconnect:
-        _ws_clients.remove(websocket)
+        if websocket in _ws_clients:
+            _ws_clients.remove(websocket)
 
 
-# ── WebSocket — tutor streaming ───────────────────────────────────────────
-
+# ── WebSocket: tutor streaming ────────────────────────────────────────────
 
 @app.websocket("/ws/tutor")
 async def ws_tutor(websocket: WebSocket):
-    """Stream Tutor agent responses token-by-token."""
+    """WebSocket: stream tutor responses token-by-token."""
     await websocket.accept()
     try:
         while True:
@@ -852,56 +812,54 @@ async def ws_tutor(websocket: WebSocket):
             payload = json.loads(data)
             question = payload.get("question", "")
             session_id = payload.get("session_id", "default")
+            api_key = _resolve_api_key(payload.get("api_key", ""))
+            if not api_key:
+                await websocket.send_text(json.dumps({"status": "error", "message": "No API key provided."}))
+                continue
 
-            api_key = gemini_api_key()
+            history = _session_histories[session_id][-3:]
+            messages = [
+                {"role": "system", "content": "SQL educator. Concise numbered lessons with SQL examples."},
+            ]
+            for h in history:
+                if h.get("role") and h.get("content"):
+                    messages.append({"role": h["role"], "content": h["content"]})
+            messages.append({"role": "user", "content": question})
 
-            async def stream_tutor():
-                history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert database educator. "
-                            "Explain concepts in clear, numbered micro-lessons with SQL examples. "
-                            "Be concise and pedagogically progressive."
-                        ),
-                    }
-                ]
-                for h in history:
-                    messages.append({"role": "user", "content": h.get("content", "")})
-                messages.append({"role": "user", "content": question})
+            # FIXED: collect chunks sync in executor, then send async
+            loop = asyncio.get_running_loop()
 
-                import litellm
-                response = litellm.completion(
-                    model="gemini/gemini-2.5-flash",
-                    messages=messages,
-                    api_key=api_key,
-                    stream=True,
-                )
-                full = ""
-                for chunk in response:
-                    delta = chunk.choices[0].delta.content or ""
-                    full += delta
+            def _stream_sync():
+                chunks = []
+                try:
+                    resp = _litellm_call(messages, api_key, stream=True)
+                    for chunk in resp:
+                        delta = chunk.choices[0].delta.content or ""
+                        if delta:
+                            chunks.append(delta)
+                except Exception as exc:
+                    chunks.append(f"\n[Error: {_friendly_error(exc)}]")
+                return chunks
+
+            try:
+                chunks = await loop.run_in_executor(_executor, _stream_sync)
+                full_text = ""
+                for delta in chunks:
+                    full_text += delta
                     await websocket.send_text(json.dumps({"status": "token", "token": delta}))
-                await websocket.send_text(json.dumps({"status": "done", "full": full}))
-                _session_histories[session_id].append({"role": "assistant", "content": full})
-
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(_executor, lambda: asyncio.run(stream_tutor()))
-
+                await websocket.send_text(json.dumps({"status": "done", "full": full_text}))
+                _session_histories[session_id].append({"role": "assistant", "content": full_text})
+            except Exception as exc:
+                await websocket.send_text(json.dumps({"status": "error", "message": _friendly_error(exc)}))
     except WebSocketDisconnect:
         pass
 
 
-# ── WebSocket — unified chat ──────────────────────────────────────────────
-
+# ── WebSocket: unified chat ───────────────────────────────────────────────
 
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
-    """
-    Unified chat WebSocket. Router classifies request and delegates to
-    the correct agent (Query Crew, Tutor, or Optimizer).
-    """
+    """Unified chat: classifies and routes to query pipeline, tutor, or optimizer."""
     await websocket.accept()
     _ws_clients.append(websocket)
     try:
@@ -911,28 +869,19 @@ async def ws_chat(websocket: WebSocket):
             question = payload.get("question", "")
             dialect = payload.get("dialect", "mysql")
             session_id = payload.get("session_id", "default")
+            api_key = _resolve_api_key(payload.get("api_key", ""))
+            if not api_key:
+                await websocket.send_text(json.dumps({"status": "error", "message": "No API key provided."}))
+                continue
 
             await websocket.send_text(json.dumps({"status": "routing", "message": "Classifying request…"}))
-
-            # Lightweight classification via LiteLLM
-            api_key = gemini_api_key()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _classify():
-                resp = litellm.completion(
-                    model="gemini/gemini-2.5-flash",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Classify the user's request as QUERY, TUTOR, or ANALYZE. "
-                                "Return ONLY one word."
-                            ),
-                        },
-                        {"role": "user", "content": question},
-                    ],
-                    api_key=api_key,
-                )
+                resp = _litellm_call([
+                    {"role": "system", "content": "Classify as QUERY, TUTOR, or ANALYZE. Return ONLY one word."},
+                    {"role": "user", "content": question},
+                ], api_key)
                 return resp.choices[0].message.content.strip().upper()
 
             intent = await loop.run_in_executor(_executor, _classify)
@@ -940,45 +889,33 @@ async def ws_chat(websocket: WebSocket):
 
             if intent == "TUTOR":
                 def _tutor():
-                    resp = litellm.completion(
-                        model="gemini/gemini-2.5-flash",
-                        messages=[
-                            {"role": "system", "content": "You are an expert database educator. Give step-by-step SQL lessons."},
-                            {"role": "user", "content": question},
-                        ],
-                        api_key=api_key,
-                    )
+                    resp = _litellm_call([
+                        {"role": "system", "content": "SQL educator. Give concise numbered lessons."},
+                        {"role": "user", "content": question},
+                    ], api_key)
                     return resp.choices[0].message.content.strip()
                 answer = await loop.run_in_executor(_executor, _tutor)
                 await websocket.send_text(json.dumps({"status": "done", "agent": "tutor", "answer": answer}))
 
             elif intent == "ANALYZE":
                 await websocket.send_text(json.dumps({
-                    "status": "done",
-                    "agent": "optimizer",
+                    "status": "done", "agent": "optimizer",
                     "answer": "Connect to a database and run a query first to enable optimizer analysis.",
                 }))
 
             else:  # QUERY
                 try:
-                    from app.agents.hierarchical_crew import run_hierarchical_query
-                    history = _session_histories[session_id][-MAX_SESSION_HISTORY:]
+                    from app.agents.graph import run_agent_pipeline
+                    history = _session_histories[session_id][-3:]
                     history_str = json.dumps(history) if history else "None"
-                    await websocket.send_text(json.dumps({"status": "architect", "message": "Architect is planning…"}))
+                    await websocket.send_text(json.dumps({"status": "architect", "message": "Planning…"}))
                     plan: ValidatedQueryPlan = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            _executor,
-                            lambda: run_hierarchical_query(question, dialect, history_str),
-                        ),
+                        loop.run_in_executor(_executor, lambda: run_agent_pipeline(question, dialect, history_str, api_key)),
                         timeout=120.0,
                     )
-                    await websocket.send_text(json.dumps({
-                        "status": "done",
-                        "agent": "query_crew",
-                        "plan": plan.model_dump(),
-                    }))
+                    await websocket.send_text(json.dumps({"status": "done", "agent": "query_pipeline", "plan": plan.model_dump()}))
                 except Exception as exc:
-                    await websocket.send_text(json.dumps({"status": "error", "message": str(exc)}))
+                    await websocket.send_text(json.dumps({"status": "error", "message": _friendly_error(exc)}))
 
     except WebSocketDisconnect:
         if websocket in _ws_clients:

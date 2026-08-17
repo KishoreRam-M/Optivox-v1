@@ -544,7 +544,7 @@ async def list_tasks():
 async def run_sql(req: RunRequest):
     """Execute arbitrary SELECT SQL in the sandboxed SQLite database."""
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(_executor, lambda: _run_sql(req.sql))
         return {"status": "ok", **result}
     except ValueError as e:
@@ -561,7 +561,7 @@ async def check_answer(req: CheckRequest):
         raise HTTPException(status_code=404, detail="Task not found.")
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(_executor, lambda: _run_sql(req.sql))
     except Exception as e:
         return {"correct": False, "message": f"SQL error: {e}", "xp_earned": 0}
@@ -605,7 +605,7 @@ async def get_hint(req: HintRequest, request: Request):
             """).strip()
 
             api_key = gemini_api_key()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 _executor,
                 lambda: litellm.completion(

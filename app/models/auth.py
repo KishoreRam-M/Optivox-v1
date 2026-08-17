@@ -13,13 +13,13 @@ class ConnectionModel(BaseModel):
     user: str
     password: str
     database: str
-    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle)$")
+    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle|mssql)$")
 
 
 class QueryRequest(BaseModel):
     """Single natural-language query request."""
     question: str
-    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle)$")
+    dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle|mssql)$")
     connection: ConnectionModel
     session_id: Optional[str] = None
 

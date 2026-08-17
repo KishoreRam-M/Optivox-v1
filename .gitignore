@@ -62,7 +62,17 @@ frontend/.pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
-# CrewAI / Agents
-.crewai/
+# LangGraph / Agents cache
+.langgraph/
+langgraph_cache/
 outputs/
 logs/
+
+# LanceDB data (vector store — commit pre-seeded data if needed for cold starts)
+# Uncomment the next line to track lancedb_data in git:
+# !lancedb_data/
+lancedb_data/
+
+# Audit log (ephemeral — do not commit)
+audit.db
+/tmp/audit.db

@@ -1,8 +1,7 @@
 """
 models/query_plan.py
 --------------------
-Typed data contracts passed between CrewAI agents.
-All agent output_pydantic fields must reference these models.
+Typed data contracts for the LangGraph agent pipeline.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from pydantic import BaseModel, Field
 
 
 class ExecutionPlan(BaseModel):
-    """Produced by the Architect agent."""
+    """Produced by the Architect node."""
     steps: List[str] = Field(description="Ordered list of natural-language steps to execute.")
     tables_involved: List[str] = Field(description="Table names the query will touch.")
     requires_transaction: bool = Field(
@@ -26,9 +25,9 @@ class ExecutionPlan(BaseModel):
 
 
 class ValidatedQueryPlan(BaseModel):
-    """Produced by the Generator and approved by the Reviewer."""
+    """Final output of the full agent pipeline."""
     sql: str = Field(description="The final SQL statement ready for execution.")
-    dialect: str = Field(description="SQL dialect: mysql | postgres | oracle")
+    dialect: str = Field(description="SQL dialect: mysql | postgres | oracle | mssql")
     is_destructive: bool = Field(
         default=False,
         description="True for DROP, TRUNCATE, or DELETE without WHERE.",

@@ -27,9 +27,26 @@
   - **Database Tutor**: Teaches database concepts dynamically with tailored examples and lessons.
   - **Query Optimizer**: Analyzes queries (and `EXPLAIN` plans) to recommend performance tweaks, index additions, and query rewrites.
   - **Schema Analyzer**: Generates foreign key maps, identifies missing indexes, spots isolated tables, and provides AI-driven DBA recommendations.
+- **📊 Agentic CSV Database Engine**: Upload raw CSV files, and OptiVox will automatically parse headers, infer column types (INTEGER, REAL, DATE, TEXT), dynamically build an isolated SQLite database on the fly, and expose a live query editor!
 - **💻 Interactive SQL Playground**: A dynamic workspace for executing multi-statement SQL scripts with real-time markdown-rendered results and explanations.
 - **🔌 Multi-Dialect Support**: Seamlessly connects to **MySQL, PostgreSQL, and Oracle** databases using an intelligent connection string parser.
 - **🔒 Production-Grade Security**: Features audit logging, robust rate limiting, SQL AST validation (via `sqlglot`) to prevent destructive queries, and comprehensive security middleware.
+
+## 📸 UI Showcase
+
+### Agentic CSV Database Engine
+![CSV Database List](https://via.placeholder.com/800x400/1a1a1a/8a2be2?text=Drag+and+Drop+CSV+List+Screenshot+Here)
+*Easily manage multiple isolated SQLite databases generated from your CSV files.*
+
+![Live Query Editor](https://via.placeholder.com/800x400/1a1a1a/8a2be2?text=Drag+and+Drop+CSV+Query+Screenshot+Here)
+*Write and execute SQL instantly with live schema preview and results.*
+
+### Database Tutor & Schema Analysis
+![Database Tutor](https://via.placeholder.com/800x400/1a1a1a/8a2be2?text=Drag+and+Drop+Database+Tutor+Screenshot+Here)
+*Learn advanced concepts like JOINs through interactive, contextual examples.*
+
+![Schema Analysis](https://via.placeholder.com/800x400/1a1a1a/8a2be2?text=Drag+and+Drop+Schema+Analysis+Screenshot+Here)
+*AI-driven recommendations for indexing, isolated tables, and query optimization.*
 
 ## 🏗️ Architecture
 
@@ -126,6 +143,27 @@ npm run dev
 ```
 
 Visit `http://localhost:5173` in your browser to access the OptiVox studio.
+
+---
+
+## ☁️ Deployment
+
+For production, it is highly recommended to use a **split deployment** to ensure the backend has a persistent disk for SQLite (CSV feature) and LanceDB vector files.
+
+### 1. Backend (Render / Railway)
+1. Create a new Web Service on [Render](https://render.com/).
+2. Connect your backend repository.
+3. Use the following settings:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+4. Add environment variables (`GEMINI_API_KEY`, etc.).
+
+### 2. Frontend (Vercel)
+1. Create a new project on [Vercel](https://vercel.com/).
+2. Connect your frontend repository and select **Vite** as the framework.
+3. Add an environment variable:
+   - `VITE_API_BASE_URL`: The URL of your deployed backend (e.g., `https://optivox-backend.onrender.com/api`).
+4. Deploy!
 
 ---
 

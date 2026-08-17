@@ -1,42 +1,43 @@
 """
 tools/rag_tool.py
 -----------------
-CrewAI-compatible RAG retrieval tool for schema context and query history.
+RAG retrieval functions for schema context and query history.
+These are plain Python functions (no framework-specific base classes).
+Used directly by LangGraph nodes.
 """
 
 from __future__ import annotations
 
-from crewai.tools import BaseTool
-from pydantic import BaseModel, Field
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-class SchemaQueryInput(BaseModel):
-    question: str = Field(description="The natural language question to retrieve schema context for.")
+def fetch_schema_context(question: str, top_k: int = 3) -> str:
+    """
+    Retrieve the most relevant database table DDLs for a natural language question.
+    Always call this before generating SQL to ensure real column names are used.
+    Returns a multi-line string of DDL snippets, or empty string if unavailable.
+    """
+    try:
+        from app.rag.embedder import fetch_schema_context as _fetch
+        result = _fetch(question, top_k=top_k)
+        return result or ""
+    except Exception as exc:
+        logger.warning("fetch_schema_context failed: %s", exc)
+        return ""
 
 
-class RAGSchemaTool(BaseTool):
-    name: str = "fetch_schema_context"
-    description: str = (
-        "Retrieves the most relevant database table DDLs for a given natural language question. "
-        "Always call this before generating SQL to ensure you reference real column names."
-    )
-    args_schema: type[BaseModel] = SchemaQueryInput
-
-    def _run(self, question: str) -> str:
-        from app.rag.embedder import fetch_schema_context
-        context = fetch_schema_context(question, top_k=3)
-        return context if context else "No schema context available. Use the schema passed in the task description."
-
-
-class RAGHistoryTool(BaseTool):
-    name: str = "fetch_query_history"
-    description: str = (
-        "Retrieves similar past question/SQL pairs as few-shot examples. "
-        "Use these to guide your SQL generation style and correctness."
-    )
-    args_schema: type[BaseModel] = SchemaQueryInput
-
-    def _run(self, question: str) -> str:
-        from app.rag.embedder import fetch_query_history
-        history = fetch_query_history(question, top_k=2)
-        return history if history else "No query history available."
+def fetch_query_history(question: str, top_k: int = 2) -> str:
+    """
+    Retrieve similar past question/SQL pairs as few-shot examples.
+    Use these to guide SQL generation style and correctness.
+    Returns a multi-line string of examples, or empty string if unavailable.
+    """
+    try:
+        from app.rag.embedder import fetch_query_history as _fetch
+        result = _fetch(question, top_k=top_k)
+        return result or ""
+    except Exception as exc:
+        logger.warning("fetch_query_history failed: %s", exc)
+        return ""

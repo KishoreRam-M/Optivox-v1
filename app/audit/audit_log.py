@@ -25,9 +25,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import os
+
 logger = logging.getLogger(__name__)
 
-_AUDIT_DB_PATH = Path("./audit.db")
+# Configurable via AUDIT_DB_PATH env var — defaults to /tmp/audit.db for
+# serverless/ephemeral environments. Override to ./audit.db for local dev.
+_AUDIT_DB_PATH = Path(os.environ.get("AUDIT_DB_PATH", "/tmp/audit.db"))
+
 _lock = threading.Lock()
 
 

@@ -14,9 +14,14 @@ from typing import Any, Dict, List, Optional
 import lancedb
 import numpy as np
 
+import os
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = "./lancedb_data"
+# Configurable via LANCEDB_PATH env var — defaults to ./lancedb_data for local dev.
+# On serverless platforms, use a shared/persistent volume path.
+DB_PATH = os.environ.get("LANCEDB_PATH", "./lancedb_data")
+
 
 _TABLE_SCHEMA_DOCS = "schema_docs"
 _TABLE_QUERY_HISTORY = "query_history"

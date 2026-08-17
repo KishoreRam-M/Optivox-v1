@@ -3,10 +3,11 @@ import axios from 'axios';
 import {
   Trophy, Star, Lightbulb, Play, CheckCircle2, XCircle,
   ChevronRight, RotateCcw, Lock, Zap, BookOpen, TerminalSquare,
-  Loader2, AlertCircle, Table2, Award
+  Loader2, AlertCircle, Table2, Award, RefreshCw
 } from 'lucide-react';
 
-const API = 'http://localhost:8000/api/playground';
+const API = (import.meta.env.VITE_API_BASE_URL || '/api') + '/playground';
+
 
 const LEVEL_NAMES = {
   1: 'SELECT Basics',
@@ -38,6 +39,8 @@ export default function PlaygroundSection() {
   const [hint, setHint]             = useState(null);
   const [loading, setLoading]       = useState(false);
   const [hintLoading, setHintLoading] = useState(false);
+  const [tasksLoading, setTasksLoading] = useState(true);
+  const [tasksError, setTasksError]   = useState('');
   const [completed, setCompleted]   = useState(() => {
     try { return JSON.parse(localStorage.getItem('pg_completed') || '{}'); } catch { return {}; }
   });
@@ -48,10 +51,25 @@ export default function PlaygroundSection() {
   const [runError, setRunError]     = useState('');
   const textareaRef = useRef(null);
 
-  useEffect(() => {
-    axios.get(`${API}/tasks`).then(r => setTasks(r.data.tasks || []));
-    axios.get(`${API}/schema`).then(r => setSchema(r.data.schema || {}));
-  }, []);
+  const loadTasks = () => {
+    setTasksLoading(true);
+    setTasksError('');
+    Promise.all([
+      axios.get(`${API}/tasks`),
+      axios.get(`${API}/schema`),
+    ])
+      .then(([tasksRes, schemaRes]) => {
+        setTasks(tasksRes.data.tasks || []);
+        setSchema(schemaRes.data.schema || {});
+      })
+      .catch(err => {
+        const msg = err.response?.data?.detail || err.message || 'Failed to load challenges.';
+        setTasksError(msg);
+      })
+      .finally(() => setTasksLoading(false));
+  };
+
+  useEffect(() => { loadTasks(); }, []);
 
   const openTask = (task) => {
     setActiveTask(task);
@@ -137,7 +155,7 @@ export default function PlaygroundSection() {
         <div className="pg-topbar-left">
           <Trophy size={20} className="pg-trophy" />
           <span className="pg-title">SQL Playground</span>
-          <span className="pg-subtitle">Learn by doing • 13 challenges</span>
+          <span className="pg-subtitle">Learn by doing • {tasks.length} challenges</span>
         </div>
         <div className="pg-topbar-right">
           <div className="pg-xp-bar-wrap">
@@ -145,7 +163,7 @@ export default function PlaygroundSection() {
               <Zap size={14} /> {totalXP} XP
             </div>
             <div className="pg-xp-track">
-              <div className="pg-xp-fill" style={{ width: `${Math.min(100, (totalXP / maxXP) * 100)}%` }} />
+              <div className="pg-xp-fill" style={{ width: `${maxXP > 0 ? Math.min(100, (totalXP / maxXP) * 100) : 0}%` }} />
             </div>
           </div>
           <div className="pg-badge">{completedCount}/{tasks.length} done</div>
@@ -166,7 +184,44 @@ export default function PlaygroundSection() {
       {/* ── Task Browser ── */}
       {view === 'tasks' && (
         <div className="pg-task-browser">
-          {Object.entries(levelGroups).map(([level, lvlTasks]) => (
+          {/* Loading state */}
+          {tasksLoading && (
+            <div className="pg-result-empty">
+              <Loader2 size={36} className="loading-spinner" style={{ color: 'var(--accent-primary)' }} />
+              <p style={{ marginTop: '1rem', color: 'var(--text-secondary)' }}>Loading challenges…</p>
+            </div>
+          )}
+
+          {/* Error state */}
+          {!tasksLoading && tasksError && (
+            <div className="pg-result-empty">
+              <AlertCircle size={36} style={{ color: 'var(--error)' }} />
+              <p style={{ marginTop: '1rem', color: 'var(--error)', maxWidth: 400, textAlign: 'center' }}>
+                {tasksError}
+              </p>
+              <button
+                className="pg-btn-run"
+                style={{ marginTop: '1.25rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+                onClick={loadTasks}
+              >
+                <RefreshCw size={15} /> Retry
+              </button>
+            </div>
+          )}
+
+          {/* Empty state (loaded but no tasks) */}
+          {!tasksLoading && !tasksError && tasks.length === 0 && (
+            <div className="pg-result-empty">
+              <Trophy size={36} style={{ opacity: 0.4 }} />
+              <p style={{ marginTop: '1rem', color: 'var(--text-secondary)' }}>No challenges found.</p>
+              <button className="pg-btn-run" style={{ marginTop: '1rem' }} onClick={loadTasks}>
+                <RefreshCw size={15} /> Reload
+              </button>
+            </div>
+          )}
+
+          {/* Task list */}
+          {!tasksLoading && !tasksError && Object.entries(levelGroups).map(([level, lvlTasks]) => (
             <div key={level} className="pg-level-group">
               <div className="pg-level-header" style={{ borderLeftColor: LEVEL_COLORS[level] }}>
                 <span className="pg-level-badge" style={{ background: LEVEL_COLORS[level] + '22', color: LEVEL_COLORS[level], borderColor: LEVEL_COLORS[level] + '55' }}>

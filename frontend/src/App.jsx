@@ -1,30 +1,54 @@
-import React, { useState, useCallback, Component } from 'react';
+import React, { useState, useCallback, Component, useEffect } from 'react';
 import axios from 'axios';
 import { 
   Database, Zap, BookOpen, BarChart3,
   TerminalSquare, Loader2, CheckCircle2, XCircle, AlertCircle,
-  Unplug, Server, User, Lock, Hash, Globe, Gamepad2, Link, Play, Table2
+  Unplug, Server, User, Lock, Hash, Globe, Gamepad2, Link, Play, Table2, Key, FileSpreadsheet
 } from 'lucide-react';
 import PlaygroundSection from './PlaygroundSection';
+import CsvDatabaseSection from './CsvDatabaseSection';
 import MarkdownRenderer from './MarkdownRenderer';
 import useSession from './useSession';
+import { useApiKey, ApiKeySetup, ApiKeyBadge } from './ApiKeyManager';
 
-const API_BASE = 'http://localhost:8000/api';
+// ── API Base URLs ──────────────────────────────────────────────────────────
+// Set VITE_API_BASE_URL in Vercel project settings for production.
+// Dev: Vite proxy forwards /api → localhost:8000 (see vite.config.js)
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
+const _wsProto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
+const _wsHost = import.meta.env.VITE_WS_BASE_URL || `${_wsProto}://${typeof window !== 'undefined' ? window.location.host : 'localhost:8000'}`;
+const WS_BASE = _wsHost;
 
-// Global API error logging for production reliability and proper error handling
+// ── Axios interceptor — attach API key to every request ────────────────────
+axios.interceptors.request.use(config => {
+  const key = window.__optivox_api_key__;
+  if (key) {
+    config.headers['X-Gemini-API-Key'] = key;
+  }
+  return config;
+});
+
 axios.interceptors.response.use(
   response => response,
   error => {
-    console.error('[OptiVox] API Error:', error.response?.status, error.response?.data || error.message);
+    const status = error.response?.status;
+    const detail = error.response?.data?.detail || error.message;
+    if (status === 401) {
+      console.error('[OptiVox] Auth error — invalid or missing Gemini API key:', detail);
+    } else if (status === 429) {
+      console.warn('[OptiVox] Rate limited (Gemini free tier):', detail);
+    } else {
+      console.error('[OptiVox] API Error:', status, detail);
+    }
     return Promise.reject(error);
   }
 );
 
 const DIALECTS = [
-  { value: 'mysql',    label: 'MySQL',      defaultPort: 3306  },
-  { value: 'postgres', label: 'PostgreSQL', defaultPort: 5432  },
-  { value: 'oracle',   label: 'Oracle',     defaultPort: 1521  },
-  { value: 'mssql',   label: 'SQL Server',  defaultPort: 1433  },
+  { value: 'mysql',    label: 'MySQL',      defaultPort: 3306 },
+  { value: 'postgres', label: 'PostgreSQL', defaultPort: 5432 },
+  { value: 'oracle',   label: 'Oracle',     defaultPort: 1521 },
+  { value: 'mssql',   label: 'SQL Server',  defaultPort: 1433 },
 ];
 
 class ErrorBoundary extends Component {
@@ -32,15 +56,12 @@ class ErrorBoundary extends Component {
     super(props);
     this.state = { hasError: false, error: null };
   }
-
   static getDerivedStateFromError(error) {
     return { hasError: true, error };
   }
-
   componentDidCatch(error, errorInfo) {
     console.error("Application caught an error:", error, errorInfo);
   }
-
   render() {
     if (this.state.hasError) {
       return (
@@ -64,15 +85,17 @@ class ErrorBoundary extends Component {
 
 export default function App() {
   const sessionId = useSession();
+  const { apiKey, setApiKey, hasKey } = useApiKey();
+
   const [activeTab, setActiveTab]   = useState('playground');
   const [connection, setConnection] = useState(null);
   const [connecting, setConnecting] = useState(false);
   const [connError, setConnError]   = useState('');
 
   const [dbConfig, setDbConfig] = useState({
-    host:     'localhost',
+    host:     '',
     port:     3306,
-    user:     'root',
+    user:     '',
     password: '',
     database: '',
     dialect:  'mysql',
@@ -108,6 +131,11 @@ export default function App() {
     setActiveTab(id === 'connect' ? 'nl_sql' : id);
   }, []);
 
+  // Show API key setup screen before anything else
+  if (!hasKey) {
+    return <ApiKeySetup onSave={setApiKey} />;
+  }
+
   return (
     <div className="app-container">
       {/* ── Sidebar ── */}
@@ -130,13 +158,17 @@ export default function App() {
             </>
           )}
           <div style={{ margin: '0.5rem 0', borderTop: '1px solid var(--border-color)' }}></div>
-          <NavBtn id="playground" icon={<Gamepad2 />}      label="SQL Playground"    active={activeTab} set={handleNavClick} />
-          <NavBtn id="developer"  icon={<User />}          label="Developer"         active={activeTab} set={handleNavClick} />
+          <NavBtn id="playground" icon={<Gamepad2 />}         label="SQL Playground"    active={activeTab} set={handleNavClick} />
+          <NavBtn id="csv_db"     icon={<FileSpreadsheet />}  label="CSV Database"      active={activeTab} set={handleNavClick} />
+          <NavBtn id="developer"  icon={<User />}             label="Developer"         active={activeTab} set={handleNavClick} />
         </nav>
 
         <div className="sidebar-spacer" />
 
-        {/* Connection status pill at bottom of sidebar */}
+        {/* API Key badge */}
+        <ApiKeyBadge apiKey={apiKey} onUpdate={setApiKey} />
+
+        {/* Connection status pill */}
         {connection ? (
           <div className="conn-status-block">
             <div className="conn-status-pill connected">
@@ -159,7 +191,10 @@ export default function App() {
       <main className="main-content">
         <ErrorBoundary>
           <div style={{ display: activeTab === 'playground' ? 'block' : 'none', height: '100%' }}>
-            <PlaygroundSection />
+            <PlaygroundSection apiKey={apiKey} />
+          </div>
+          <div style={{ display: activeTab === 'csv_db' ? 'block' : 'none', height: '100%' }}>
+            <CsvDatabaseSection />
           </div>
           <div style={{ display: activeTab === 'developer' ? 'block' : 'none', height: '100%' }}>
             <DeveloperSection />
@@ -180,16 +215,16 @@ export default function App() {
           {connection && (
             <>
               <div style={{ display: activeTab === 'nl_sql' ? 'block' : 'none', height: '100%' }}>
-                <NLSqlSection connection={connection} sessionId={sessionId} />
+                <NLSqlSection connection={connection} sessionId={sessionId} apiKey={apiKey} />
               </div>
               <div style={{ display: activeTab === 'teach' ? 'block' : 'none', height: '100%' }}>
-                <TeachSection sessionId={sessionId} />
+                <TeachSection sessionId={sessionId} apiKey={apiKey} />
               </div>
               <div style={{ display: activeTab === 'optimize' ? 'block' : 'none', height: '100%' }}>
-                <OptimizeSection connection={connection} sessionId={sessionId} />
+                <OptimizeSection connection={connection} sessionId={sessionId} apiKey={apiKey} />
               </div>
               <div style={{ display: activeTab === 'schema' ? 'block' : 'none', height: '100%' }}>
-                <SchemaSection connection={connection} />
+                <SchemaSection connection={connection} apiKey={apiKey} />
               </div>
             </>
           )}
@@ -213,7 +248,7 @@ const NavBtn = React.memo(function NavBtn({ id, icon, label, active, set }) {
 });
 
 /* ────────────────────────────────────────────────────────
-   Connection Setup Screen (main area)
+   Connection Setup Screen
 ──────────────────────────────────────────────────────── */
 const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, setDbConfig, handleDialectChange, handleConnect, connecting, connError }) {
   const [dbUrl, setDbUrl] = useState('');
@@ -223,12 +258,9 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
     if (!url.trim()) return;
     try {
       const parsed = new URL(url.trim());
-      
       let dialect = parsed.protocol.replace(':', '');
       if (dialect === 'postgresql') dialect = 'postgres';
-      
       const newConfig = { ...dbConfig };
-      
       if (dialect) {
         const matchingDialect = DIALECTS.find(d => d.value === dialect);
         if (matchingDialect) {
@@ -236,7 +268,6 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
           newConfig.port = matchingDialect.defaultPort;
         }
       }
-      
       if (parsed.hostname) newConfig.host = parsed.hostname;
       if (parsed.port) newConfig.port = parseInt(parsed.port, 10);
       if (parsed.username) newConfig.user = decodeURIComponent(parsed.username);
@@ -244,7 +275,6 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
       if (parsed.pathname && parsed.pathname.length > 1) {
         newConfig.database = parsed.pathname.substring(1);
       }
-      
       setDbConfig(newConfig);
     } catch (e) {
       // Ignore parse errors
@@ -302,7 +332,7 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
               <label><Globe size={14} /> Host</label>
               <input
                 type="text"
-                placeholder="localhost or IP address"
+                placeholder="e.g. db.example.com"
                 value={dbConfig.host}
                 onChange={e => setField('host', e.target.value)}
                 required
@@ -377,7 +407,7 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
 /* ────────────────────────────────────────────────────────
    1. Natural Language SQL Generation
 ──────────────────────────────────────────────────────── */
-const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId }) {
+const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId, apiKey }) {
   const [question, setQuestion] = useState('');
   const [mode,     setMode]     = useState('fast');
   const [loading,  setLoading]  = useState(false);
@@ -401,7 +431,12 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId })
       });
       setResult(res.data);
     } catch (err) {
-      setError(err.response?.data?.detail || err.message);
+      const detail = err.response?.data?.detail || err.message;
+      setError(err.response?.status === 429
+        ? '⏱ Rate limit reached — Gemini free tier: 15 RPM. Wait 60s and try again.'
+        : err.response?.status === 401
+          ? '🔑 Invalid API key. Click the key badge in the sidebar to update it.'
+          : detail);
     } finally {
       setLoading(false);
     }
@@ -412,7 +447,7 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId })
     setExplainLoading(true); setExplanation('');
     try {
       const res = await axios.post(`${API_BASE}/adia/teach`, {
-        question: `Explain the following SQL query step by step, clearly and concisely. Use markdown formatting with numbered steps:\n\n\`\`\`sql\n${result.sql}\n\`\`\``,
+        question: `Explain step by step, using markdown:\n\`\`\`sql\n${result.sql}\n\`\`\``,
         session_id: sessionId,
       });
       setExplanation(res.data.answer);
@@ -446,7 +481,7 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId })
     <div className="glass-card">
       <div className="header">
         <h1>Natural Language to SQL</h1>
-        <p>Translate plain English directly into safe, validated SQL queries — then run and explain them inline.</p>
+        <p>Translate plain English into safe, validated SQL — then run and explain inline.</p>
       </div>
 
       <div className="textarea-wrapper">
@@ -459,10 +494,10 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId })
         />
       </div>
 
-      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1.5rem' }}>
-        <select value={mode} onChange={e => setMode(e.target.value)} style={{ width: '220px' }}>
-          <option value="fast">Fast (Single Model)</option>
-          <option value="crew">Autonomous Agents (CrewAI)</option>
+      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
+        <select value={mode} onChange={e => setMode(e.target.value)} style={{ width: '240px' }}>
+          <option value="fast">⚡ Fast Mode (1 API call)</option>
+          <option value="agent">🤖 Agent Mode (LangGraph pipeline)</option>
         </select>
         <button className="btn-primary" onClick={generate} disabled={loading} style={{ width: '200px' }}>
           {loading ? <><Loader2 className="loading-spinner" size={18} /> Generating…</> : 'Generate SQL'}
@@ -514,14 +549,12 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId })
             </div>
           )}
 
-          {/* Execution error */}
           {execError && (
             <div className="status-badge error" style={{ margin: '1rem 0' }}>
               <AlertCircle size={16} /> {execError}
             </div>
           )}
 
-          {/* Execution results */}
           {execResult && (
             <div className="exec-result-wrap">
               <div className="exec-result-header">
@@ -581,7 +614,7 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId })
 /* ────────────────────────────────────────────────────────
    2. Teaching Section
 ──────────────────────────────────────────────────────── */
-const TeachSection = React.memo(function TeachSection({ sessionId }) {
+const TeachSection = React.memo(function TeachSection({ sessionId, apiKey }) {
   const [question, setQuestion] = useState('');
   const [loading,  setLoading]  = useState(false);
   const [history,  setHistory]  = useState([]);
@@ -596,7 +629,10 @@ const TeachSection = React.memo(function TeachSection({ sessionId }) {
       const res = await axios.post(`${API_BASE}/adia/teach`, { question: q, session_id: sessionId });
       setHistory(prev => [...prev, { role: 'assistant', content: res.data.answer }]);
     } catch (err) {
-      setHistory(prev => [...prev, { role: 'assistant', content: '**Error:** ' + (err.response?.data?.detail || err.message) }]);
+      const msg = err.response?.status === 429
+        ? '⏱ Rate limit reached. Wait 60s and try again.'
+        : '**Error:** ' + (err.response?.data?.detail || err.message);
+      setHistory(prev => [...prev, { role: 'assistant', content: msg }]);
     } finally {
       setLoading(false);
     }
@@ -651,22 +687,23 @@ const TeachSection = React.memo(function TeachSection({ sessionId }) {
 /* ────────────────────────────────────────────────────────
    3. Query Optimization
 ──────────────────────────────────────────────────────── */
-const OptimizeSection = React.memo(function OptimizeSection({ connection }) {
+const OptimizeSection = React.memo(function OptimizeSection({ connection, apiKey }) {
   const [sql,     setSql]     = useState('');
   const [explain, setExplain] = useState('');
   const [loading, setLoading] = useState(false);
   const [result,  setResult]  = useState(null);
+  const [error,   setError]   = useState('');
 
   const optimize = async () => {
     if (!sql) return;
-    setLoading(true); setResult(null);
+    setLoading(true); setResult(null); setError('');
     try {
       const res = await axios.post(`${API_BASE}/adia/optimize`, {
         sql, dialect: connection.dialect, explain_output: explain,
       });
       setResult(res.data);
     } catch (err) {
-      alert('Error: ' + (err.response?.data?.detail || err.message));
+      setError(err.response?.data?.detail || err.message);
     } finally {
       setLoading(false);
     }
@@ -693,6 +730,12 @@ const OptimizeSection = React.memo(function OptimizeSection({ connection }) {
       <button className="btn-primary" onClick={optimize} disabled={loading} style={{ width: '250px', marginTop: '1rem' }}>
         {loading ? <Loader2 className="loading-spinner" /> : 'Analyze Performance'}
       </button>
+
+      {error && (
+        <div className="status-badge error" style={{ marginTop: '1rem' }}>
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
 
       {result && (
         <div style={{ marginTop: '2rem' }}>
@@ -729,17 +772,18 @@ const OptimizeSection = React.memo(function OptimizeSection({ connection }) {
 /* ────────────────────────────────────────────────────────
    4. Schema Analysis
 ──────────────────────────────────────────────────────── */
-const SchemaSection = React.memo(function SchemaSection({ connection }) {
+const SchemaSection = React.memo(function SchemaSection({ connection, apiKey }) {
   const [loading, setLoading] = useState(false);
   const [result,  setResult]  = useState(null);
+  const [error,   setError]   = useState('');
 
   const analyze = async () => {
-    setLoading(true); setResult(null);
+    setLoading(true); setResult(null); setError('');
     try {
       const res = await axios.post(`${API_BASE}/adia/schema-analysis`, connection);
       setResult(res.data);
     } catch (err) {
-      alert('Error: ' + (err.response?.data?.detail || err.message));
+      setError(err.response?.data?.detail || err.message);
     } finally {
       setLoading(false);
     }
@@ -756,6 +800,12 @@ const SchemaSection = React.memo(function SchemaSection({ connection }) {
           {loading ? <Loader2 className="loading-spinner" /> : 'Run Analysis'}
         </button>
       </div>
+
+      {error && (
+        <div className="status-badge error" style={{ marginTop: '1rem' }}>
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
 
       {result && (
         <div style={{ marginTop: '2rem' }}>
