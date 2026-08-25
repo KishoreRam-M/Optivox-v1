@@ -1,35 +1,71 @@
 {
-  "cc164b81": {
-    "db_id": "cc164b81",
-    "company_name": "langchain",
+  "e787af3f": {
+    "db_id": "e787af3f",
+    "company_name": "house",
     "description": "",
-    "db_path": "csv_databases\\cc164b81.db",
+    "db_path": "csv_databases\\e787af3f.db",
     "tables": [
       {
-        "table_name": "langchain_examples",
+        "table_name": "housing",
         "columns": [
           {
-            "name": "topic",
+            "name": "price",
+            "type": "INTEGER"
+          },
+          {
+            "name": "area",
+            "type": "INTEGER"
+          },
+          {
+            "name": "bedrooms",
+            "type": "INTEGER"
+          },
+          {
+            "name": "bathrooms",
+            "type": "INTEGER"
+          },
+          {
+            "name": "stories",
+            "type": "INTEGER"
+          },
+          {
+            "name": "mainroad",
             "type": "TEXT"
           },
           {
-            "name": "example",
+            "name": "guestroom",
             "type": "TEXT"
           },
           {
-            "name": "description",
+            "name": "basement",
             "type": "TEXT"
           },
           {
-            "name": "package",
+            "name": "hotwaterheating",
+            "type": "TEXT"
+          },
+          {
+            "name": "airconditioning",
+            "type": "TEXT"
+          },
+          {
+            "name": "parking",
+            "type": "INTEGER"
+          },
+          {
+            "name": "prefarea",
+            "type": "TEXT"
+          },
+          {
+            "name": "furnishingstatus",
             "type": "TEXT"
           }
         ],
-        "row_count": 6,
-        "original_filename": "langchain_examples.csv"
+        "row_count": 545,
+        "original_filename": "Housing.csv"
       }
     ],
-    "created_at": "2026-08-17T10:00:28Z",
-    "total_rows": 6
+    "created_at": "2026-08-25T04:39:29Z",
+    "total_rows": 545
   }
 }

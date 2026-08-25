@@ -4,26 +4,35 @@ app/core/cache.py
 Lightweight in-memory response cache for Gemini API calls.
 
 Strategy:
-- Key = (prompt_hash, model)
-- TTL = 5 minutes (fresh enough for SQL generation)
-- Max 200 entries (LRU eviction)
+- Key  = (prompt_hash, model)
+- TTL  = 30 minutes (covers repeated NL→SQL questions in a session)
+- Max  = 200 entries (LRU eviction)
 
-This dramatically reduces Gemini free tier RPD consumption
-when users ask similar questions repeatedly.
+Free-tier impact:
+  Repeated identical questions return the cached SQL without consuming
+  any Gemini RPD (requests-per-day) quota — significant for the 1500 RPD
+  limit on the free tier.
+
+Model is resolved via GEMINI_MODEL env var (default: gemini-2.5-flash)
+so switching models doesn't silently serve stale cross-model cache hits.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import OrderedDict
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_CACHE_TTL = 300       # 5 minutes
+_CACHE_TTL = 1800      # 30 minutes — long enough to cover a typical work session
 _CACHE_MAX = 200       # max entries before LRU eviction
+
+# Resolved once at import; avoids cross-model cache pollution
+_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 class LRUCache:
@@ -34,11 +43,12 @@ class LRUCache:
         self._max = max_size
         self._ttl = ttl
 
-    def _key(self, prompt: str, model: str = "gemini-2.5-flash") -> str:
-        raw = f"{model}:{prompt}"
+    def _key(self, prompt: str, model: str = "") -> str:
+        effective_model = model or _DEFAULT_MODEL
+        raw = f"{effective_model}:{prompt}"
         return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
-    def get(self, prompt: str, model: str = "gemini-2.5-flash") -> Optional[str]:
+    def get(self, prompt: str, model: str = "") -> Optional[str]:
         k = self._key(prompt, model)
         if k not in self._store:
             return None
@@ -50,7 +60,7 @@ class LRUCache:
         self._store.move_to_end(k)
         return value
 
-    def set(self, prompt: str, value: str, model: str = "gemini-2.5-flash") -> None:
+    def set(self, prompt: str, value: str, model: str = "") -> None:
         k = self._key(prompt, model)
         if k in self._store:
             self._store.move_to_end(k)

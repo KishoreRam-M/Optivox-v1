@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ConnectionModel(BaseModel):
@@ -14,6 +14,14 @@ class ConnectionModel(BaseModel):
     password: str
     database: str
     dialect: str = Field("mysql", pattern="^(mysql|postgres|oracle|mssql)$")
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def _strip_host(cls, v: str) -> str:
+        v = str(v).strip()
+        if not v:
+            raise ValueError("host must not be empty")
+        return v
 
 
 class QueryRequest(BaseModel):

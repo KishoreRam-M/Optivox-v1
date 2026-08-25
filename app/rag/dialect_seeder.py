@@ -1,7 +1,7 @@
 """
 rag/dialect_seeder.py
 ----------------------
-Pre-loads dialect_docs LanceDB table with SQL curriculum content:
+Pre-loads the dialect_docs Pinecone namespace with SQL curriculum content:
   - Beginner: basics, SELECT, WHERE, ORDER BY, LIMIT/ROWNUM, ILIKE
   - Intermediate: JOINs, GROUP BY, subqueries, CTEs
   - Advanced: window functions, indexes, query optimization patterns
@@ -288,23 +288,34 @@ DIALECT_DOCS: List[Dict[str, str]] = [
 
 def seed_dialect_docs() -> None:
     """
-    Embed all DIALECT_DOCS into LanceDB dialect_docs table.
-    Safe to call multiple times — uses merge_insert (upsert).
+    Embed all DIALECT_DOCS into the Pinecone dialect_docs namespace.
+
+    Seeding guard: if the namespace already contains vectors (from a previous
+    startup), the function exits immediately without making any Gemini API calls.
+    This prevents unnecessary API usage on every server restart.
+
+    Free-tier note: embed_dialect_docs() applies a 0.2s inter-call sleep between
+    individual docs to stay comfortably under the 5 RPM embedding API limit.
+    The _EmbedRateLimiter in embedder.py provides a second line of defence.
+
+    Safe to call multiple times — uses Pinecone upsert (idempotent).
     """
     try:
-        from app.rag.embedder import _get_db, _embed, _ensure_table, _TABLE_DIALECT_DOCS
-        db = _get_db()
-        tbl = _ensure_table(db, _TABLE_DIALECT_DOCS, {})
-        rows = []
-        for doc in DIALECT_DOCS:
-            rows.append({
-                "id": doc["id"],
-                "text": doc["text"],
-                "vector": _embed(doc["text"]),
-                "metadata": f'{{"level": "{doc["level"]}", "topic": "{doc["topic"]}"}}',
-            })
-        if rows:
-            tbl.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(rows)
-            logger.info("Seeded %d dialect docs into LanceDB.", len(rows))
+        from app.rag.embedder import is_namespace_populated, embed_dialect_docs, _NS_DIALECT_DOCS
+
+        # Guard: skip if already seeded
+        if is_namespace_populated(_NS_DIALECT_DOCS, min_vectors=len(DIALECT_DOCS)):
+            logger.info(
+                "[seeder] Dialect docs already seeded (%d docs in Pinecone/%s). Skipping.",
+                len(DIALECT_DOCS), _NS_DIALECT_DOCS,
+            )
+            return
+
+        logger.info(
+            "[seeder] Seeding %d dialect docs into Pinecone/%s (inter-call delay=0.2s)…",
+            len(DIALECT_DOCS), _NS_DIALECT_DOCS,
+        )
+        embed_dialect_docs(DIALECT_DOCS, inter_call_delay=0.2)
+        logger.info("[seeder] Dialect doc seeding complete.")
     except Exception as exc:
         logger.error("Dialect doc seeding failed: %s", exc)

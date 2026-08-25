@@ -22,12 +22,14 @@ _DIALECT_DRIVERS: Dict[str, str] = {
     "mysql":    "mysql+pymysql",
     "postgres": "postgresql+psycopg2",
     "oracle":   "oracle+oracledb",
+    "mssql":    "mssql+pyodbc",
 }
 
 _DEFAULT_PORTS: Dict[str, int] = {
     "mysql":    3306,
     "postgres": 5432,
     "oracle":   1521,
+    "mssql":    1433,
 }
 
 _ENGINE_CACHE_TTL = 1800  # seconds
@@ -39,7 +41,7 @@ _engine_cache: Dict[str, Dict[str, Any]] = {}
 def _conn_key(conn: Dict[str, Any]) -> str:
     dialect = conn.get("dialect", "mysql")
     port = conn.get("port", _DEFAULT_PORTS.get(dialect, 3306))
-    return f"{conn['dialect']}://{conn['user']}@{conn['host']}:{port}/{conn['database']}"
+    return f"{dialect}://{conn.get('user', '')}@{conn.get('host', '')}:{port}/{conn.get('database', '')}"
 
 
 def _build_url(conn: Dict[str, Any]) -> URL:

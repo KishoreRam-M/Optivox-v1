@@ -82,7 +82,13 @@ export default function PlaygroundSection() {
   };
 
   const runSQL = async () => {
-    if (!sql.trim() || sql.trim().startsWith('--')) return;
+    // BUG-4: Strip comments before the empty-check so that a query starting with
+    // `-- Write your SQL here` followed by real SQL correctly gets executed.
+    const cleanSql = sql.replace(/--.*$/gm, '').trim();
+    if (!cleanSql) {
+      setRunError('Query is empty \u2014 write a SQL statement below the comment line.');
+      return;
+    }
     setLoading(true); setResult(null); setRunError('');
     try {
       const r = await axios.post(`${API}/run`, { sql });

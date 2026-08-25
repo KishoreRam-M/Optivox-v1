@@ -438,11 +438,16 @@ function QueryExplorer({ dbId, companyName, onBack }) {
   };
 
   const runQuery = async () => {
+    // BUG-3: Strip SQL comments before sending to API so comment-only queries
+    // don't silently return 0 rows. Send the cleaned SQL to the backend.
     const cleanSql = sql.replace(/--.*$/gm, '').trim();
-    if (!cleanSql) return;
+    if (!cleanSql) {
+      setRunError('Query is empty. Write a SELECT statement below the comments.');
+      return;
+    }
     setRunning(true); setResult(null); setRunError('');
     try {
-      const r = await axios.post(`${API}/${dbId}/query`, { sql });
+      const r = await axios.post(`${API}/${dbId}/query`, { sql: cleanSql });
       setResult(r.data);
     } catch (e) {
       setRunError(e.response?.data?.detail || e.message);

@@ -128,7 +128,8 @@ export default function App() {
   };
 
   const handleNavClick = useCallback((id) => {
-    setActiveTab(id === 'connect' ? 'nl_sql' : id);
+    // 'connect' is a virtual tab that shows the ConnectScreen
+    setActiveTab(id === 'connect' ? 'connect' : id);
   }, []);
 
   // Show API key setup screen before anything else
@@ -147,7 +148,7 @@ export default function App() {
 
         <nav className="nav-menu">
           {!connection && (
-            <NavBtn id="connect" icon={<Database />} label="Connect DB" active={(activeTab === 'playground' || activeTab === 'developer') ? '' : 'connect'} set={handleNavClick} />
+            <NavBtn id="connect" icon={<Database />} label="Connect DB" active={activeTab} set={handleNavClick} />
           )}
           {connection && (
             <>
@@ -200,7 +201,7 @@ export default function App() {
             <DeveloperSection />
           </div>
           
-          <div style={{ display: (!connection && activeTab !== 'playground' && activeTab !== 'developer') ? 'block' : 'none', height: '100%' }}>
+          <div style={{ display: (!connection && activeTab !== 'playground' && activeTab !== 'developer' && activeTab !== 'csv_db') ? 'block' : 'none', height: '100%' }}>
             <ConnectScreen
               dbConfig={dbConfig}
               setField={setField}
@@ -257,14 +258,25 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
     setDbUrl(url);
     if (!url.trim()) return;
     try {
-      const parsed = new URL(url.trim());
-      let dialect = parsed.protocol.replace(':', '');
-      if (dialect === 'postgresql') dialect = 'postgres';
+      // Browser's URL API only handles standard schemes (http/https/ws/wss).
+      // Non-standard schemes like mysql:// cause hostname truncation (e.g.
+      // "localhost" becomes "locat"). Normalise to http:// for parsing,
+      // then recover the real dialect from the original string.
+      const raw = url.trim();
+      const schemeMatch = raw.match(/^([a-z][a-z0-9+\-.]*)::\/\//i) ||
+                          raw.match(/^([a-z][a-z0-9+\-.]*):(\/\/)/i);
+      let rawDialect = schemeMatch ? schemeMatch[1].toLowerCase() : '';
+      if (rawDialect === 'postgresql') rawDialect = 'postgres';
+
+      // Replace the custom scheme with http:// so URL() parses correctly.
+      const normalised = raw.replace(/^[a-z][a-z0-9+\-.]*:\/\//i, 'http://');
+      const parsed = new URL(normalised);
+
       const newConfig = { ...dbConfig };
-      if (dialect) {
-        const matchingDialect = DIALECTS.find(d => d.value === dialect);
+      if (rawDialect) {
+        const matchingDialect = DIALECTS.find(d => d.value === rawDialect);
         if (matchingDialect) {
-          newConfig.dialect = dialect;
+          newConfig.dialect = rawDialect;
           newConfig.port = matchingDialect.defaultPort;
         }
       }
@@ -277,7 +289,7 @@ const ConnectScreen = React.memo(function ConnectScreen({ dbConfig, setField, se
       }
       setDbConfig(newConfig);
     } catch (e) {
-      // Ignore parse errors
+      // Ignore parse errors — user may still be typing
     }
   };
 
@@ -563,7 +575,7 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId, a
                   {execResult.statements_executed > 1 && (
                     <span>{execResult.statements_executed} statements</span>
                   )}
-                  {execResult.row_count !== undefined && (
+                  {execResult.row_count !== undefined && execResult.columns?.length > 0 && (
                     <span className="exec-badge">{execResult.row_count} rows</span>
                   )}
                   {execResult.rows_affected !== undefined && (
@@ -599,8 +611,16 @@ const NLSqlSection = React.memo(function NLSqlSection({ connection, sessionId, a
                 </>
               ) : (
                 <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-secondary)' }}>
-                  ✅ {execResult.statements_executed} statement{execResult.statements_executed !== 1 ? 's' : ''} executed successfully.
-                  {execResult.rows_affected !== undefined && execResult.rows_affected > 0 && ` ${execResult.rows_affected} rows affected.`}
+                  {/* BUG-2 fix: clearly distinguish DML success from empty SELECT */}
+                  {execResult.rows_affected !== undefined && execResult.rows_affected > 0 ? (
+                    <span style={{ color: 'var(--success)', fontWeight: 600 }}>
+                      ✅ {execResult.rows_affected} row{execResult.rows_affected !== 1 ? 's' : ''} affected.
+                    </span>
+                  ) : (
+                    <span>
+                      ✅ {execResult.statements_executed} statement{execResult.statements_executed !== 1 ? 's' : ''} executed successfully.
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -894,7 +914,7 @@ const DeveloperSection = React.memo(function DeveloperSection() {
             Currently, I am a final-year Computer Science and Engineering student at Vel Tech Multi Tech Engineering College. My academic journey has equipped me with a strong foundation in software development, data structures, algorithms, and system design, enabling me to approach complex problems with a structured and analytical mindset.
           </p>
           <p>
-            I am also an aspiring Data Engineer, driven by a keen interest in designing scalable data pipelines, working with large datasets, and transforming raw data into meaningful insights. I am eager to contribute to real-world projects where I can apply my skills in data engineering, machine learning, and AI-driven solutions.
+            I am also an aspiring AI Engineer, driven by a keen interest in designing scalable data pipelines, working with large datasets, and transforming raw data into meaningful insights. I am eager to contribute to real-world projects where I can apply my skills in data engineering, machine learning, and AI-driven solutions.
           </p>
         </div>
       </div>

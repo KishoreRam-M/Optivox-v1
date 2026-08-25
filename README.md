@@ -3,13 +3,13 @@
 
   # OptiVox DB — Agentic AI SQL Studio
 
-  **Transforming Database Interactions with CrewAI, LiteLLM, and LanceDB**
+  **Transforming Database Interactions with LangGraph, LiteLLM, Pinecone, and Gemini Embeddings**
 
   [![Python](https://img.shields.io/badge/Python-3.11%2B-blue?style=for-the-badge&logo=python&logoColor=white)](#)
   [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-00a393?style=for-the-badge&logo=fastapi&logoColor=white)](#)
   [![React](https://img.shields.io/badge/React-19-61dafb?style=for-the-badge&logo=react&logoColor=black)](#)
-  [![CrewAI](https://img.shields.io/badge/CrewAI-Agentic%20Framework-ff69b4?style=for-the-badge)](#)
-  [![LanceDB](https://img.shields.io/badge/LanceDB-Vector%20Search-yellow?style=for-the-badge)](#)
+  [![LangGraph](https://img.shields.io/badge/LangGraph-Agentic%20Framework-ff69b4?style=for-the-badge)](#)
+  [![Pinecone](https://img.shields.io/badge/Pinecone-Vector%20Search-00c4b4?style=for-the-badge)](#)
 
   <p>
     An intelligent, autonomous platform that translates natural language to executable SQL, provides deep schema analysis, teaches database concepts, and optimizes queries.
@@ -20,8 +20,8 @@
 
 ## ✨ Key Features
 
-- **🧠 Agentic SQL Generation (CrewAI)**: A multi-agent hierarchical crew (Architect → Generator → Reviewer) autonomously drafts, refines, and validates complex SQL queries from natural language.
-- **📚 RAG Schema Search (LanceDB)**: Automatically extracts your database schema, generates embeddings using `sentence-transformers`, and injects relevant context into the LLM prompt for highly accurate, hallucination-free SQL.
+- **🧠 Agentic SQL Generation (LangGraph)**: A multi-agent hierarchical pipeline (Architect → Generator → Reviewer) autonomously drafts, refines, and validates complex SQL queries from natural language.
+- **📚 RAG Schema Search (Pinecone + Gemini Embeddings)**: Automatically extracts your database schema, generates embeddings using `gemini-embedding-001` via the Gemini API, and injects relevant context into the LLM prompt for highly accurate, hallucination-free SQL.
 - **🛠️ ADIA (Agentic Database Intelligent Assistant)**:
   - **Natural Language to SQL**: Converts plain-English questions to database-specific queries.
   - **Database Tutor**: Teaches database concepts dynamically with tailored examples and lessons.
@@ -60,14 +60,15 @@ graph TD
         Auth <--> Connector[Database Connector]
         
         API <--> RAG[RAG Engine]
-        RAG --> LanceDB[(LanceDB Vector Store)]
         Connector --> Extractor[Schema Extractor]
-        Extractor --> RAG
+        Extractor --> Embed[Gemini Embedding API]
+        Embed --> Pinecone[(Pinecone Vector Store)]
+        RAG --> Pinecone
         
-        API <--> Agents[CrewAI Pipeline]
-        Agents --> Architect[Architect Agent]
-        Agents --> Generator[Generator Agent]
-        Agents --> Reviewer[Reviewer Agent]
+        API <--> Agents[LangGraph Pipeline]
+        Agents --> Architect[Architect Node]
+        Agents --> Generator[Generator Node]
+        Agents --> Reviewer[Reviewer Node]
         
         Agents <--> LLM[LiteLLM / Gemini API]
         
@@ -83,8 +84,9 @@ graph TD
 
 ### Backend
 - **Framework**: FastAPI, Uvicorn
-- **AI & Agents**: CrewAI, LiteLLM (Google Gemini 2.5 Flash)
-- **Vector Database**: LanceDB, Sentence Transformers, Pandas, PyArrow
+- **AI & Agents**: LangGraph, LiteLLM (Google Gemini 2.5 Flash)
+- **Vector Database**: Pinecone (cloud, serverless)
+- **Embeddings**: Google Gemini API (`gemini-embedding-001`, 3072 dims)
 - **Database Tools**: SQLAlchemy, PyMySQL, Psycopg2, OracleDB
 - **Validation**: SQLGlot (AST parsing & safety checks)
 - **Caching & State**: Cachetools, ThreadPoolExecutor
@@ -108,8 +110,8 @@ graph TD
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/your-username/Optivox-Upgrade.git
-cd Optivox-Upgrade/Backend
+git clone https://github.com/KishoreRam-M/Optivox-v1.git
+cd Optivox-v1
 ```
 
 ### 2. Backend Setup
@@ -118,14 +120,15 @@ Create a virtual environment and install dependencies:
 python -m venv .venv
 source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 pip install uv
-uv sync # Or pip install -e .
+uv sync # Or pip install -r requirements.txt
 ```
 
 Configure your environment variables:
-Create a `.env` file in the `Backend` directory:
+Create a `.env` file in the root directory (you can copy `.env.example`):
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
-# Add other optional environment variables if needed
+PINECONE_API_KEY=your_pinecone_api_key_here
+PINECONE_INDEX_NAME=optivox-rag   # optional, this is the default
 ```
 
 Start the FastAPI server:
@@ -165,13 +168,15 @@ For production, it is highly recommended to use a **split deployment** to ensure
    - `VITE_API_BASE_URL`: The URL of your deployed backend (e.g., `https://optivox-backend.onrender.com/api`).
 4. Deploy!
 
+> **Note:** The backend no longer requires a persistent disk volume. Pinecone is fully cloud-hosted, so any serverless or ephemeral deployment (Render free tier, Railway, etc.) works without extra storage configuration.
+
 ---
 
 ## 📂 Project Structure
 
 ```text
-Backend/
-├── app/
+Optivox-v1/
+├── app/                 # Backend Application
 │   ├── agents/          # CrewAI agents and tools
 │   ├── api/             # FastAPI routers and endpoints
 │   ├── audit/           # Audit logging and SQLite db setup
@@ -181,12 +186,15 @@ Backend/
 │   ├── security/        # API key management and secrets
 │   ├── tools/           # SQL AST parser and validation utilities
 │   └── main.py          # Application entry point
-├── frontend/
+├── frontend/            # React Frontend Application
 │   ├── src/             # React components, contexts, and hooks
 │   ├── index.html       # HTML entry point
 │   ├── package.json     # Node dependencies
 │   └── vite.config.js   # Vite configuration
+├── csv_databases/       # SQLite databases generated from CSVs
+├── lancedb_data/        # LanceDB vector data storage
 ├── pyproject.toml       # Python dependencies and metadata
+├── requirements.txt     # Python dependencies list
 └── ...
 ```
 

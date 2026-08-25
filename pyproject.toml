@@ -1,7 +1,7 @@
 [project]
 name = "optivox-backend"
 version = "4.0.0"
-description = "OptiVox DB — Agentic AI SQL Studio powered by LangGraph + LiteLLM + LanceDB"
+description = "OptiVox DB — Agentic AI SQL Studio powered by LangGraph + LiteLLM + Pinecone + Gemini Embeddings"
 requires-python = ">=3.11"
 
 dependencies = [
@@ -28,13 +28,11 @@ dependencies = [
     "oracledb>=2.3.0",
     # SQL parsing / validation
     "sqlglot>=25.0.0",
-    # RAG
-    "lancedb>=0.11.0",
-    "sentence-transformers>=3.0.0",
-    "pandas>=2.2.0",
+    # RAG — cloud vector store + cloud embeddings
+    "pinecone>=3.0.0",
+    "google-generativeai>=0.8.0",
     # Utilities
     "cachetools>=5.3.3",
-    "pyarrow>=24.0.0",
     "httpx>=0.27.0",
 ]
 

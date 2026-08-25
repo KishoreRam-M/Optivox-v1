@@ -22,7 +22,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/playground", tags=["Playground"])
@@ -473,10 +473,24 @@ def _clean_sql(sql: str) -> str:
     return sql
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Remove single-line (--) SQL comments from a query string."""
+    lines = []
+    for line in sql.splitlines():
+        # Strip inline comment but keep the rest of the line
+        comment_idx = line.find('--')
+        if comment_idx >= 0:
+            line = line[:comment_idx]
+        lines.append(line)
+    return '\n'.join(lines).strip()
+
+
 def _run_sql(sql: str) -> Dict[str, Any]:
     sql = _clean_sql(sql)
-    # Block destructive statements
-    upper = sql.upper().strip()
+    # BUG-9: Strip comments before checking for forbidden keywords
+    # so that e.g. `-- note\nSELECT ...` correctly passes the check
+    sql_no_comments = _strip_sql_comments(sql)
+    upper = sql_no_comments.upper().strip()
     for kw in ("DROP", "DELETE", "TRUNCATE", "ALTER", "CREATE", "INSERT", "UPDATE", "PRAGMA", "ATTACH"):
         if upper.startswith(kw):
             raise ValueError(f"Statement type '{kw}' is not allowed in the playground.")
@@ -576,7 +590,7 @@ async def check_answer(req: CheckRequest):
 
 
 @router.post("/hint")
-async def get_hint(req: HintRequest, request: Request):
+async def get_hint(req: HintRequest, request: Request, x_gemini_api_key: Optional[str] = Header(default=None)):
     """AI-powered contextual hint for a playground task."""
     task = next((t for t in TASKS if t["id"] == req.task_id), None)
     if not task:
@@ -591,6 +605,11 @@ async def get_hint(req: HintRequest, request: Request):
             import litellm
             from app.security.secrets import gemini_api_key
 
+            # BUG-5: prefer user-supplied API key from header; fall back to server env key
+            api_key = (x_gemini_api_key or "").strip() or gemini_api_key()
+            if not api_key:
+                return {"hint": static_hint, "tier": "static"}
+
             prompt = textwrap.dedent(f"""
                 You are a friendly SQL tutor helping a student with this task:
 
@@ -604,7 +623,6 @@ async def get_hint(req: HintRequest, request: Request):
                 or what to improve. Do NOT reveal the answer. Be beginner-friendly.
             """).strip()
 
-            api_key = gemini_api_key()
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 _executor,

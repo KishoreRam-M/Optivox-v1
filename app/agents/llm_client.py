@@ -6,15 +6,19 @@ LLM client using langchain-google-genai.
 Supports user-provided API keys (sent per-request from the frontend).
 Falls back to the GEMINI_API_KEY environment variable if no key is provided.
 
-Gemini 2.5 Flash free tier limits:
+Gemini 2.5 Flash free tier limits (LLM):
   - 15 RPM  (requests per minute)
   - 1M  TPM (tokens per minute)
   - 1500 RPD (requests per day)
 
+Gemini embedding-001 free tier limits:
+  - 5 RPM  (requests per minute)  ← enforced by _EmbedRateLimiter in embedder.py
+  - 100 RPD (requests per day)    ← conserved by in-memory embed cache
+
 Optimized settings:
   - temperature=0 for deterministic, reproducible SQL
   - max_retries=3 with exponential backoff for 429 handling
-  - thinking_budget=0 disables expensive chain-of-thought on flash
+  - thinking_budget=0 disables expensive chain-of-thought on flash, saving tokens
 """
 
 from __future__ import annotations
@@ -49,8 +53,8 @@ def get_llm(api_key: Optional[str] = None) -> ChatGoogleGenerativeAI:
         google_api_key=key,
         temperature=0.0,
         max_retries=3,          # built-in retry with backoff for 429
-        # Disable thinking budget to save tokens on the free tier
-        # thinking={"thinking_budget": _THINKING_BUDGET},
+        # Disable chain-of-thought thinking to save tokens on the free tier
+        thinking={"thinking_budget": _THINKING_BUDGET},
     )
 
 

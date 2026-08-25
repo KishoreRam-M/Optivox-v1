@@ -285,7 +285,10 @@ def _run_query(db_path: str, sql: str, limit: int = 500) -> dict[str, Any]:
     forbidden = ("DROP", "DELETE", "TRUNCATE", "ALTER", "CREATE", "INSERT", "UPDATE", "PRAGMA", "ATTACH", "DETACH")
     for kw in forbidden:
         if re.match(rf"^\s*{kw}\b", upper):
-            raise ValueError(f"Statement type '{kw}' is not allowed.")
+            raise ValueError(
+                f"Statement type '{kw}' is not allowed. "
+                "This database is read-only — only SELECT queries are supported."
+            )
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -427,11 +430,12 @@ async def run_query(db_id: str, req: QueryRequest):
 async def preview_table(db_id: str, table_name: str, limit: int = 50):
     """Preview the first N rows of a table."""
     entry = _get_db(db_id)
+    capped = min(limit, 500)
     try:
+        # BUG-6: LIMIT is baked into the SQL; don't also pass limit param (it would be ignored anyway)
         result = _run_query(
             entry["db_path"],
-            f'SELECT * FROM "{table_name}" LIMIT {min(limit, 500)}',
-            limit=min(limit, 500),
+            f'SELECT * FROM "{table_name}" LIMIT {capped}',
         )
         return {"status": "ok", **result}
     except sqlite3.Error as exc:

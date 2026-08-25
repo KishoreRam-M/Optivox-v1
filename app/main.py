@@ -10,7 +10,7 @@ Key optimizations for Gemini 2.5 Flash free tier:
   - Token-optimized prompts in all LiteLLM calls
   - Graceful degradation when API key is missing
   - CORS reads ALLOWED_ORIGINS from env (safe for production)
-  - Configurable paths for LanceDB and Audit DB
+  - Configurable Pinecone index and Audit DB paths
   - asyncio.get_running_loop() throughout (Python 3.10+ compatible)
   - ws_tutor bug fixed (no asyncio.run inside running loop)
 """
@@ -133,6 +133,35 @@ def _litellm_call(
     raise last_exc
 
 
+# ── SQL extraction helper (BUG-7 fix) ────────────────────────────────────
+
+_SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
+
+def _extract_sql(raw: str) -> str:
+    """
+    Robustly extract SQL from an LLM response.
+
+    Priority order:
+      1. Content inside a ```sql ... ``` or ``` ... ``` fence.
+      2. Full response after stripping any fence markers (fallback).
+
+    Handles cases where the LLM adds explanation text before or after the SQL block.
+    """
+    raw = raw.strip()
+    # 1. Try to extract from a fenced code block
+    match = _SQL_FENCE_RE.search(raw)
+    if match:
+        return match.group(1).strip()
+    # 2. Fallback: strip stray fence markers line-by-line
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -140,26 +169,38 @@ async def lifespan(app: FastAPI):
     logger.info("OptiVox DB starting up (free-tier optimized).")
     init_audit_db()
 
-    # Pre-seed dialect docs (RAG)
-    from app.rag.dialect_seeder import seed_dialect_docs
-    try:
-        seed_dialect_docs()
-    except Exception as e:
-        logger.error("Failed to seed dialect docs: %s", e)
-
-    # Pre-warm LangGraph pipeline
-    try:
-        from app.agents.graph import get_graph
-        get_graph()
-        logger.info("LangGraph pipeline ready.")
-    except Exception as e:
-        logger.error("LangGraph warm-up failed: %s", e)
-
+    # Run seeding + warm-up in background so the server becomes available immediately.
+    # seed_dialect_docs makes up to 16 synchronous Gemini API calls — running it
+    # in the lifespan directly blocks startup for several seconds.
+    asyncio.create_task(_background_startup())
     asyncio.create_task(_drift_loop())
     asyncio.create_task(_cleanup_rate_limits())
     yield
     logger.info("OptiVox DB shutting down.")
     _executor.shutdown(wait=False)
+
+
+async def _background_startup():
+    """Non-blocking startup tasks: dialect seeding + LangGraph warm-up.
+    Runs in the thread pool to avoid blocking the asyncio event loop during
+    synchronous Gemini embedding API calls.
+    """
+    loop = asyncio.get_running_loop()
+
+    # Pre-seed dialect docs (RAG) — 16 Gemini embed calls, runs in executor
+    from app.rag.dialect_seeder import seed_dialect_docs
+    try:
+        await loop.run_in_executor(_executor, seed_dialect_docs)
+    except Exception as e:
+        logger.error("Failed to seed dialect docs: %s", e)
+
+    # Pre-warm LangGraph pipeline (compile graph once)
+    try:
+        from app.agents.graph import get_graph
+        await loop.run_in_executor(_executor, get_graph)
+        logger.info("LangGraph pipeline ready.")
+    except Exception as e:
+        logger.error("LangGraph warm-up failed: %s", e)
 
 
 async def _drift_loop():
@@ -354,15 +395,14 @@ Return ONLY the SQL. No markdown. No explanation."""
                 _executor,
                 lambda: _litellm_call([{"role": "user", "content": prompt}], api_key),
             )
-            sql = response.choices[0].message.content.strip()
-            sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
-            sql = re.sub(r"```", "", sql).strip()
+            sql = _extract_sql(response.choices[0].message.content)
             cache.set(prompt, sql)
         except Exception as exc:
             logger.error("/api/query failed: %s", traceback.format_exc())
             raise HTTPException(status_code=500, detail=_friendly_error(exc))
 
     is_safe, reason = validate_sql_ast(sql, req.dialect)
+    _session_histories[session_id].append({"role": "user", "content": req.question, "sql": sql})
     return {"sql": sql, "dialect": req.dialect, "safe": is_safe, "safety_reason": reason, "session_id": session_id}
 
 
@@ -472,11 +512,20 @@ async def execute_query(req: ExecuteRequest, request: Request):
 
         data = await loop.run_in_executor(_executor, _run)
         session_id = req.session_id or "default"
+
+        # Embed query history for RAG
         try:
             from app.rag.embedder import embed_query_history
             await loop.run_in_executor(_executor, lambda: embed_query_history(req.sql, req.sql, session_id))
         except Exception:
             pass
+
+        # BUG-8: Re-embed schema if DDL was executed so RAG context stays fresh
+        _DDL_RE = re.compile(r"^\s*(CREATE|ALTER|DROP)\s+TABLE", re.IGNORECASE)
+        if any(_DDL_RE.match(s) for s in req.sql.split(';') if s.strip()):
+            logger.info("[execute] DDL detected — triggering background schema re-embed.")
+            asyncio.create_task(_embed_schema_bg(req.connection.model_dump()))
+
         return {"status": "success", **data}
     except Exception as exc:
         logger.error("Execute failed: %s", exc)
@@ -572,9 +621,7 @@ Return ONLY the SQL. No markdown."""
                     _executor,
                     lambda: _litellm_call([{"role": "user", "content": prompt}], api_key),
                 )
-                sql = resp.choices[0].message.content.strip()
-                sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
-                sql = re.sub(r"```", "", sql).strip()
+                sql = _extract_sql(resp.choices[0].message.content)
                 cache.set(prompt, sql)
             except Exception as exc:
                 logger.error("ADIA NL-SQL fast failed: %s", traceback.format_exc())

@@ -68,7 +68,7 @@ def _extract_sql(raw: str) -> str:
 # ── Nodes ─────────────────────────────────────────────────────────────────
 
 def rag_node(state: AgentState) -> Dict[str, Any]:
-    """Fetch schema context + query history from LanceDB (single function call)."""
+    """Fetch schema context + query history from Pinecone (single function call)."""
     logger.info("[rag] Fetching context for: %.60s", state["question"])
     try:
         from app.rag.embedder import fetch_schema_context, fetch_query_history
