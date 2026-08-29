@@ -20,6 +20,18 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+
+def _parse_fk_reference(ref_str: str) -> tuple[str, str]:
+    """
+    Parse a references string in the format 'table_name(column_name)'.
+    Returns (ref_table, ref_col). Falls back to (ref_str, '') on unexpected format.
+    """
+    if ref_str and "(" in ref_str and ref_str.endswith(")"):
+        table_part, col_part = ref_str.rsplit("(", 1)
+        return table_part.strip(), col_part.rstrip(")").strip()
+    return ref_str, ""
+
+
 def analyze_schema(
     tables: List[Dict[str, Any]],
     engine=None,
@@ -35,6 +47,9 @@ def analyze_schema(
     table_count = len(tables)
 
     # ── FK relationship map ─────────────────────────────────────────────
+    # Each FK dict from schema_extractor has the shape:
+    #   {"column": "fk_col", "references": "other_table(other_col)"}
+    # We parse "references" to extract the target table and column.
     fk_map: Dict[str, List[Dict[str, str]]] = {}
     all_fk_tables: set[str] = set()
 
@@ -45,24 +60,28 @@ def analyze_schema(
             fk_map[name] = []
             all_fk_tables.add(name)
             for fk in fks:
+                ref_str = fk.get("references", "")
+                ref_table, ref_col = _parse_fk_reference(ref_str)
                 fk_map[name].append({
                     "from_col": fk.get("column", ""),
-                    "to_table": fk.get("ref_table", ""),
-                    "to_col":   fk.get("ref_column", ""),
+                    "to_table": ref_table,
+                    "to_col":   ref_col,
                 })
 
     # Also mark tables that are referenced BY foreign keys
     for t in tables:
         for fk in t.get("foreign_keys", []):
-            rt = fk.get("ref_table", "")
-            if rt:
-                all_fk_tables.add(rt)
+            ref_str = fk.get("references", "")
+            ref_table, _ = _parse_fk_reference(ref_str)
+            if ref_table:
+                all_fk_tables.add(ref_table)
 
     # ── Isolated tables (no FKs in OR out) ─────────────────────────────
     isolated_tables = [
         t["table_name"] for t in tables
         if t.get("table_name") not in all_fk_tables
     ]
+
 
     # ── Missing index suggestions ───────────────────────────────────────
     missing_index_suggestions: List[Dict[str, str]] = []

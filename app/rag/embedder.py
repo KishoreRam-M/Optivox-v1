@@ -39,28 +39,42 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────
+# Config is read lazily via functions (not module-level constants) so that
+# load_dotenv() in main.py has already populated os.environ before first use.
 
-PINECONE_API_KEY: str    = os.environ.get("PINECONE_API_KEY", "")
-PINECONE_INDEX_NAME: str = os.environ.get("PINECONE_INDEX_NAME", "optivox-rag")
-GEMINI_API_KEY: str      = os.environ.get("GEMINI_API_KEY", "")
+import threading as _threading
 
-# gemini-embedding-001 free-tier outputs 768 dims (NOT 3072 — that requires paid quota)
-EMBEDDING_DIM: int = int(os.environ.get("EMBEDDING_DIM", "768"))
+def _cfg_pinecone_api_key() -> str:
+    return os.environ.get("PINECONE_API_KEY", "")
 
-# Embedding model name — override via env if needed
-GEMINI_EMBED_MODEL: str = os.environ.get("GEMINI_EMBED_MODEL", "models/gemini-embedding-001")
+def _cfg_pinecone_index_name() -> str:
+    return os.environ.get("PINECONE_INDEX_NAME", "optivox-rag")
+
+def _cfg_gemini_api_key() -> str:
+    return os.environ.get("GEMINI_API_KEY", "")
+
+def _cfg_embedding_dim() -> int:
+    return int(os.environ.get("EMBEDDING_DIM", "768"))
+
+def _cfg_embed_model() -> str:
+    return os.environ.get("GEMINI_EMBED_MODEL", "models/gemini-embedding-001")
+
+# Keep these as module-level for backward-compat (read from env on each access via property)
+PINECONE_INDEX_NAME: str = ""
 
 # Pinecone metadata text size cap (free tier: 40 KB per vector; we cap at 38 KB for safety)
 _METADATA_TEXT_MAX_BYTES = 38_000
 
-# Pinecone namespace per logical collection (replaces LanceDB tables)
+# Pinecone namespace per logical collection
 _NS_SCHEMA_DOCS   = "schema_docs"
 _NS_QUERY_HISTORY = "query_history"
 _NS_DIALECT_DOCS  = "dialect_docs"
 
 # Lazy-initialised clients
-_pinecone_index  = None
+_pinecone_index   = None
 _genai_configured = False
+_genai_lock       = _threading.Lock()
+_index_lock       = _threading.Lock()
 
 
 # ── Embed Vector Cache (LRU + TTL) ───────────────────────────────────────
@@ -81,6 +95,7 @@ class _EmbedCache:
         self._store: OrderedDict[str, Tuple[List[float], float]] = OrderedDict()
         self._max  = max_size
         self._ttl  = ttl
+        self._lock = _threading.Lock()
 
     def _key(self, text: str, task_type: str) -> str:
         raw = f"{task_type}:{text}"
@@ -88,26 +103,29 @@ class _EmbedCache:
 
     def get(self, text: str, task_type: str) -> Optional[List[float]]:
         k = self._key(text, task_type)
-        if k not in self._store:
-            return None
-        vec, ts = self._store[k]
-        if time.time() - ts > self._ttl:
-            del self._store[k]
-            return None
-        self._store.move_to_end(k)
-        logger.debug("[embed-cache] HIT for task_type=%s (key=%s…)", task_type, k[:12])
-        return vec
+        with self._lock:
+            if k not in self._store:
+                return None
+            vec, ts = self._store[k]
+            if time.time() - ts > self._ttl:
+                del self._store[k]
+                return None
+            self._store.move_to_end(k)
+            logger.debug("[embed-cache] HIT for task_type=%s (key=%s…)", task_type, k[:12])
+            return vec
 
     def set(self, text: str, task_type: str, vector: List[float]) -> None:
         k = self._key(text, task_type)
-        if k in self._store:
-            self._store.move_to_end(k)
-        self._store[k] = (vector, time.time())
-        if len(self._store) > self._max:
-            self._store.popitem(last=False)
+        with self._lock:
+            if k in self._store:
+                self._store.move_to_end(k)
+            self._store[k] = (vector, time.time())
+            if len(self._store) > self._max:
+                self._store.popitem(last=False)
 
     def size(self) -> int:
-        return len(self._store)
+        with self._lock:
+            return len(self._store)
 
 
 _embed_cache = _EmbedCache()
@@ -119,31 +137,33 @@ _embed_cache = _EmbedCache()
 # Prevents 429 errors before they happen — no need to wait for a retry.
 
 class _EmbedRateLimiter:
-    """Token-bucket rate limiter: max N calls per 60-second rolling window."""
+    """Thread-safe token-bucket rate limiter: max N calls per 60-second rolling window."""
 
     def __init__(self, max_per_minute: int = 5):
         self._max    = max_per_minute
         self._window = 60.0
         self._calls: List[float] = []
+        self._lock   = _threading.Lock()
 
     def acquire(self) -> None:
         """Block until a call slot is available."""
-        now = time.time()
-        # Drop timestamps outside the rolling window
-        self._calls = [t for t in self._calls if now - t < self._window]
-        if len(self._calls) >= self._max:
-            # Sleep until the oldest call falls out of the window
-            sleep_for = self._window - (now - self._calls[0]) + 0.05
-            if sleep_for > 0:
-                logger.info(
-                    "[embed-ratelimit] 5 RPM cap reached — sleeping %.1fs before next embed call.",
-                    sleep_for,
-                )
-                time.sleep(sleep_for)
-            # Refresh after sleep
+        with self._lock:
             now = time.time()
+            # Drop timestamps outside the rolling window
             self._calls = [t for t in self._calls if now - t < self._window]
-        self._calls.append(time.time())
+            if len(self._calls) >= self._max:
+                # Sleep until the oldest call falls out of the window
+                sleep_for = self._window - (now - self._calls[0]) + 0.05
+            else:
+                sleep_for = 0.0
+            self._calls.append(time.time())
+        # Sleep outside the lock so other threads aren't blocked during the wait
+        if sleep_for > 0:
+            logger.info(
+                "[embed-ratelimit] 5 RPM cap reached — sleeping %.1fs before next embed call.",
+                sleep_for,
+            )
+            time.sleep(sleep_for)
 
 
 _rate_limiter = _EmbedRateLimiter(max_per_minute=5)
@@ -153,22 +173,25 @@ _rate_limiter = _EmbedRateLimiter(max_per_minute=5)
 
 
 def _ensure_genai() -> None:
-    """Configure the Google GenAI SDK once. Raises RuntimeError on missing key."""
+    """Configure the Google GenAI SDK once. Thread-safe via _genai_lock."""
     global _genai_configured
     if _genai_configured:
         return
-    key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
-    if not key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. Embeddings require a valid Gemini API key."
+    with _genai_lock:
+        if _genai_configured:  # double-checked locking
+            return
+        key = _cfg_gemini_api_key()
+        if not key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Embeddings require a valid Gemini API key."
+            )
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        _genai_configured = True
+        logger.info(
+            "[embedder] Gemini GenAI client configured (model: %s, dim: %d).",
+            _cfg_embed_model(), _cfg_embedding_dim(),
         )
-    import google.generativeai as genai
-    genai.configure(api_key=key)
-    _genai_configured = True
-    logger.info(
-        "[embedder] Gemini GenAI client configured (model: %s, dim: %d).",
-        GEMINI_EMBED_MODEL, EMBEDDING_DIM,
-    )
 
 
 def _embed_raw(text: str, task_type: str, retries: int = 3, backoff: float = 2.0) -> List[float]:
@@ -188,15 +211,22 @@ def _embed_raw(text: str, task_type: str, retries: int = 3, backoff: float = 2.0
     _ensure_genai()
     import google.generativeai as genai
 
+    embed_model = _cfg_embed_model()
+    embed_dim   = _cfg_embedding_dim()
     last_exc: Exception = RuntimeError("Embedding failed — no attempts made.")
     for attempt in range(retries):
         try:
             result = genai.embed_content(
-                model=GEMINI_EMBED_MODEL,
+                model=embed_model,
                 content=text,
                 task_type=task_type,
             )
             vector: List[float] = result["embedding"]
+            # Dimension guard: pad or truncate if Gemini returns unexpected size
+            if len(vector) > embed_dim:
+                vector = vector[:embed_dim]
+            elif len(vector) < embed_dim:
+                vector = vector + [0.0] * (embed_dim - len(vector))
             _embed_cache.set(text, task_type, vector)
             return vector
         except Exception as exc:
@@ -269,42 +299,48 @@ def _get_index():
     if _pinecone_index is not None:
         return _pinecone_index
 
-    api_key = PINECONE_API_KEY or os.environ.get("PINECONE_API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "PINECONE_API_KEY is not set. Set it in your environment or .env file."
-        )
+    with _index_lock:
+        if _pinecone_index is not None:  # double-checked locking
+            return _pinecone_index
 
-    from pinecone import Pinecone, ServerlessSpec
+        api_key = _cfg_pinecone_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "PINECONE_API_KEY is not set. Set it in your environment or .env file."
+            )
 
-    pc = Pinecone(api_key=api_key)
-    index_name = PINECONE_INDEX_NAME or os.environ.get("PINECONE_INDEX_NAME", "optivox-rag")
+        from pinecone import Pinecone, ServerlessSpec
 
-    # Check existing indexes — avoid costly recreation on every startup
-    existing = [idx.name for idx in pc.list_indexes()]
-    if index_name not in existing:
-        logger.info(
-            "[embedder] Creating Pinecone index '%s' (dim=%d, metric=cosine, region=us-east-1).",
-            index_name, EMBEDDING_DIM,
-        )
-        pc.create_index(
-            name=index_name,
-            dimension=EMBEDDING_DIM,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-        )
-        # Poll until index is ready (up to ~60s)
-        for _ in range(30):
-            desc = pc.describe_index(index_name)
-            if desc.status.get("ready", False):
-                break
-            time.sleep(2)
-        logger.info("[embedder] Pinecone index '%s' is ready.", index_name)
-    else:
-        logger.info("[embedder] Connected to existing Pinecone index '%s'.", index_name)
+        pc = Pinecone(api_key=api_key)
+        index_name = _cfg_pinecone_index_name()
+        embed_dim  = _cfg_embedding_dim()
 
-    _pinecone_index = pc.Index(index_name)
-    return _pinecone_index
+        # Check existing indexes — avoid costly recreation on every startup
+        # Use .name attribute (compatible with all Pinecone SDK versions)
+        existing = {idx.name for idx in pc.list_indexes()}
+        if index_name not in existing:
+            logger.info(
+                "[embedder] Creating Pinecone index '%s' (dim=%d, metric=cosine, region=us-east-1).",
+                index_name, embed_dim,
+            )
+            pc.create_index(
+                name=index_name,
+                dimension=embed_dim,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
+            # Poll until index is ready (up to ~60s)
+            for _ in range(30):
+                desc = pc.describe_index(index_name)
+                if desc.status.get("ready", False):
+                    break
+                time.sleep(2)
+            logger.info("[embedder] Pinecone index '%s' is ready.", index_name)
+        else:
+            logger.info("[embedder] Connected to existing Pinecone index '%s'.", index_name)
+
+        _pinecone_index = pc.Index(index_name)
+        return _pinecone_index
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -492,6 +528,6 @@ def embed_cache_stats() -> Dict[str, Any]:
         "embed_cache_size": _embed_cache.size(),
         "embed_cache_max": _EMBED_CACHE_MAX,
         "embed_cache_ttl_sec": _EMBED_CACHE_TTL,
-        "embed_model": GEMINI_EMBED_MODEL,
-        "embed_dim": EMBEDDING_DIM,
+        "embed_model": _cfg_embed_model(),
+        "embed_dim": _cfg_embedding_dim(),
     }

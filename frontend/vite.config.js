@@ -16,6 +16,12 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path,
       },
+      // /health is the backend health endpoint — must be proxied so the
+      // ApiKeyManager setup screen can verify the backend is reachable.
+      '/health': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
       '/ws': {
         target: 'ws://localhost:8000',
         ws: true,

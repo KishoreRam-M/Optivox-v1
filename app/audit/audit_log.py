@@ -29,15 +29,33 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# Configurable via AUDIT_DB_PATH env var — defaults to /tmp/audit.db for
-# serverless/ephemeral environments. Override to ./audit.db for local dev.
-_AUDIT_DB_PATH = Path(os.environ.get("AUDIT_DB_PATH", "/tmp/audit.db"))
+
+def _get_audit_db_path() -> Path:
+    """
+    Return the audit DB path.
+
+    Priority:
+    1. AUDIT_DB_PATH env var (explicit override for production)
+    2. Cross-platform default: ~/.optivox/audit.db
+
+    This is evaluated lazily (at first call), ensuring that environment
+    variables set via load_dotenv() in main.py are already available.
+    """
+    env_path = os.environ.get("AUDIT_DB_PATH", "")
+    if env_path:
+        p = Path(env_path)
+    else:
+        p = Path.home() / ".optivox" / "audit.db"
+    # Ensure parent directory exists
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 _lock = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(_AUDIT_DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(_get_audit_db_path()), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -62,7 +80,7 @@ def init_audit_db() -> None:
                 )
             """)
             conn.commit()
-            logger.info("Audit DB initialised at %s", _AUDIT_DB_PATH)
+            logger.info("Audit DB initialised at %s", _get_audit_db_path())
         finally:
             conn.close()
 

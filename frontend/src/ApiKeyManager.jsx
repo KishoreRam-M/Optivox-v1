@@ -61,7 +61,8 @@ export function ApiKeySetup({ onSave }) {
     if (!trimmed) return;
     setTesting(true); setStatus(null); setErrMsg('');
     try {
-      const res = await fetch('/health', {
+      const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
+      const res = await fetch(`${API_BASE}/health`, {
         headers: { 'X-Gemini-API-Key': trimmed },
       });
       if (res.ok) {

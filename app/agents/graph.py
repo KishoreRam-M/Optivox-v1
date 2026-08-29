@@ -14,7 +14,6 @@ Optimized for Gemini 2.5 Flash free tier:
 from __future__ import annotations
 
 import logging
-import re
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -22,6 +21,7 @@ from langgraph.graph import END, StateGraph
 
 from app.models.query_plan import ValidatedQueryPlan
 from app.tools.sql_parser import validate_sql_ast
+from app.utils.sql_utils import extract_sql as _extract_sql
 
 logger = logging.getLogger(__name__)
 
@@ -50,19 +50,6 @@ class AgentState(TypedDict):
     approved: bool
     final_sql: str
     is_destructive: bool
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-def _extract_sql(raw: str) -> str:
-    """Strip markdown fences and extract the SQL statement."""
-    m = re.search(r"```(?:sql)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|DROP|ALTER)\b.*", raw, re.DOTALL | re.IGNORECASE)
-    if m:
-        return m.group(0).strip()
-    return raw.strip()
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────

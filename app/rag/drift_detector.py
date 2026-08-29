@@ -51,14 +51,22 @@ async def drift_detection_loop(
     from app.database.schema_extractor import extract_schema
     from app.rag.embedder import embed_schema
 
+    loop = asyncio.get_event_loop()
+
     while True:
         await asyncio.sleep(interval_sec)
         connections = get_active_connections()
         for conn in connections:
             try:
                 key = _conn_key(conn)
-                engine = get_engine(conn)
-                tables = extract_schema(engine, conn.get("dialect", "mysql"))
+
+                # Run blocking DB calls in executor to avoid blocking the event loop
+                engine = await loop.run_in_executor(None, get_engine, conn)
+                dialect = conn.get("dialect", "mysql")
+                tables  = await loop.run_in_executor(
+                    None, extract_schema, engine, dialect
+                )
+
                 changed = []
                 for t in tables:
                     ddl = t.get("ddl", "")
@@ -80,8 +88,10 @@ async def drift_detection_loop(
                         )
                     else:
                         _last_embed_ts[key] = now
-                        embed_schema(tables, key)
+                        # embed_schema is also blocking — run in executor
+                        await loop.run_in_executor(None, embed_schema, tables, key)
                     if on_drift:
                         on_drift(key, changed)
             except Exception as exc:
                 logger.error("Drift detection error for connection: %s", exc)
+

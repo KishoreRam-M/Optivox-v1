@@ -77,7 +77,11 @@ def get_engine(conn: Dict[str, Any]) -> Engine:
                 return entry["engine"]
             except Exception:
                 logger.warning("Cached engine for %s is unhealthy — recreating.", key)
-        entry["engine"].dispose()
+        # Dispose the stale/unhealthy engine and evict from cache
+        try:
+            entry["engine"].dispose()
+        except Exception:
+            pass
         del _engine_cache[key]
 
     url = _build_url(conn)

@@ -12,11 +12,10 @@ import useSession from './useSession';
 import { useApiKey, ApiKeySetup, ApiKeyBadge } from './ApiKeyManager';
 
 // ── API Base URLs ──────────────────────────────────────────────────────────
-// Set VITE_API_BASE_URL in Vercel project settings for production.
-// Dev: Vite proxy forwards /api → localhost:8000 (see vite.config.js)
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
-const _wsProto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
-const _wsHost = import.meta.env.VITE_WS_BASE_URL || `${_wsProto}://${typeof window !== 'undefined' ? window.location.host : 'localhost:8000'}`;
+// In production: set VITE_API_BASE_URL in Vercel project settings.
+// In dev:        leave unset → use '' (relative paths via Vite proxy → localhost:8000)
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
+const _wsHost = import.meta.env.VITE_WS_BASE_URL || '';
 const WS_BASE = _wsHost;
 
 // ── Axios interceptor — attach API key to every request ────────────────────
@@ -113,7 +112,7 @@ export default function App() {
     setConnecting(true);
     setConnError('');
     try {
-      await axios.post(`${API_BASE}/connect`, { ...dbConfig, session_id: sessionId });
+      await axios.post(`${API_BASE}/api/connect`, { ...dbConfig });
       setConnection(dbConfig);
     } catch (err) {
       setConnError(err.response?.data?.detail || err.message);

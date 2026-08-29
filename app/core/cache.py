@@ -26,6 +26,8 @@ import time
 from collections import OrderedDict
 from typing import Any, Optional
 
+import threading
+
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL = 1800      # 30 minutes — long enough to cover a typical work session
@@ -42,6 +44,7 @@ class LRUCache:
         self._store: OrderedDict[str, tuple[Any, float]] = OrderedDict()
         self._max = max_size
         self._ttl = ttl
+        self._lock = threading.Lock()
 
     def _key(self, prompt: str, model: str = "") -> str:
         effective_model = model or _DEFAULT_MODEL
@@ -50,30 +53,34 @@ class LRUCache:
 
     def get(self, prompt: str, model: str = "") -> Optional[str]:
         k = self._key(prompt, model)
-        if k not in self._store:
-            return None
-        value, ts = self._store[k]
-        if time.time() - ts > self._ttl:
-            del self._store[k]
-            return None
-        # Move to end (most recently used)
-        self._store.move_to_end(k)
-        return value
+        with self._lock:
+            if k not in self._store:
+                return None
+            value, ts = self._store[k]
+            if time.time() - ts > self._ttl:
+                del self._store[k]
+                return None
+            # Move to end (most recently used)
+            self._store.move_to_end(k)
+            return value
 
     def set(self, prompt: str, value: str, model: str = "") -> None:
         k = self._key(prompt, model)
-        if k in self._store:
-            self._store.move_to_end(k)
-        self._store[k] = (value, time.time())
-        if len(self._store) > self._max:
-            evicted_key, _ = self._store.popitem(last=False)
-            logger.debug("Cache evicted: %s", evicted_key)
+        with self._lock:
+            if k in self._store:
+                self._store.move_to_end(k)
+            self._store[k] = (value, time.time())
+            if len(self._store) > self._max:
+                evicted_key, _ = self._store.popitem(last=False)
+                logger.debug("Cache evicted: %s", evicted_key)
 
     def size(self) -> int:
-        return len(self._store)
+        with self._lock:
+            return len(self._store)
 
     def clear(self) -> None:
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
 
 # Singleton

@@ -28,6 +28,16 @@ import re
 import sqlite3
 import time
 import uuid
+
+# ── Security: compiled once at module import ───────────────────────────────
+_CSVDB_FORBIDDEN_RE   = re.compile(
+    r"\b(DROP|DELETE|TRUNCATE|ALTER|CREATE|INSERT|UPDATE|PRAGMA|ATTACH|DETACH)\b",
+    re.IGNORECASE,
+)
+_CSVDB_UNION_RE       = re.compile(r"\bUNION\s+(?:ALL\s+)?SELECT\b", re.IGNORECASE)
+_CSVDB_LIMIT_RE       = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+_CSVDB_STRIP_STR_RE   = re.compile(r"'[^']*'")
+
 from pathlib import Path
 from typing import Any
 
@@ -280,21 +290,31 @@ def _get_live_schema(db_path: str) -> dict[str, Any]:
 
 def _run_query(db_path: str, sql: str, limit: int = 500) -> dict[str, Any]:
     """Execute a SELECT query and return columns + rows."""
-    # Safety: block destructive statements
     upper = sql.strip().upper()
-    forbidden = ("DROP", "DELETE", "TRUNCATE", "ALTER", "CREATE", "INSERT", "UPDATE", "PRAGMA", "ATTACH", "DETACH")
-    for kw in forbidden:
-        if re.match(rf"^\s*{kw}\b", upper):
-            raise ValueError(
-                f"Statement type '{kw}' is not allowed. "
-                "This database is read-only — only SELECT queries are supported."
-            )
+
+    # Safety: block destructive statements using compiled word-boundary regex
+    m = _CSVDB_FORBIDDEN_RE.search(upper)
+    if m:
+        kw = m.group(1).upper()
+        raise ValueError(
+            f"Statement type '{kw}' is not allowed. "
+            "This database is read-only — only SELECT queries are supported."
+        )
+
+    # Block UNION-based injection
+    if _CSVDB_UNION_RE.search(upper):
+        raise ValueError("UNION SELECT is not allowed in the CSV database query endpoint.")
+
+    # Block stacked queries (strip string literals first to avoid false positives)
+    _stripped = _CSVDB_STRIP_STR_RE.sub("''", upper)
+    if ";" in _stripped.rstrip(";"):
+        raise ValueError("Multiple statements (stacked queries) are not allowed.")
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        # Apply LIMIT if not already present
-        if "LIMIT" not in upper:
+        # Apply LIMIT if not already present (µM5 fix: use word-boundary regex)
+        if not _CSVDB_LIMIT_RE.search(upper):
             sql = sql.rstrip("; \n") + f" LIMIT {limit}"
         cursor = conn.execute(sql)
         if cursor.description:

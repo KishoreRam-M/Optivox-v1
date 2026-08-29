@@ -29,6 +29,14 @@ router = APIRouter(prefix="/api/playground", tags=["Playground"])
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
+# ── Security: compiled once at module import ───────────────────────────────
+_FORBIDDEN_KW_RE  = re.compile(
+    r"\b(DROP|DELETE|TRUNCATE|ALTER|CREATE|INSERT|UPDATE|PRAGMA|ATTACH)\b",
+    re.IGNORECASE,
+)
+_UNION_SELECT_RE  = re.compile(r"\bUNION\s+(?:ALL\s+)?SELECT\b", re.IGNORECASE)
+_STRIP_STRINGS_RE = re.compile(r"'[^']*'")
+
 # ── Curriculum datasets ────────────────────────────────────────────────────
 
 CURRICULUM_DDL = """
@@ -487,13 +495,26 @@ def _strip_sql_comments(sql: str) -> str:
 
 def _run_sql(sql: str) -> Dict[str, Any]:
     sql = _clean_sql(sql)
-    # BUG-9: Strip comments before checking for forbidden keywords
-    # so that e.g. `-- note\nSELECT ...` correctly passes the check
+    # Strip comments before checking for forbidden keywords so that
+    # e.g. `-- note\nSELECT ...` correctly passes the check
     sql_no_comments = _strip_sql_comments(sql)
     upper = sql_no_comments.upper().strip()
-    for kw in ("DROP", "DELETE", "TRUNCATE", "ALTER", "CREATE", "INSERT", "UPDATE", "PRAGMA", "ATTACH"):
-        if upper.startswith(kw):
-            raise ValueError(f"Statement type '{kw}' is not allowed in the playground.")
+
+    # --- Security checks ---
+    # 1. Word-boundary check for forbidden DML/DDL (catches CTE-wrapped DML)
+    m = _FORBIDDEN_KW_RE.search(upper)
+    if m:
+        raise ValueError(f"Statement type '{m.group(1).upper()}' is not allowed in the playground.")
+
+    # 2. UNION-based injection detection
+    if _UNION_SELECT_RE.search(upper):
+        raise ValueError("UNION SELECT is not allowed in the playground.")
+
+    # 3. Stacked-query (multi-statement) detection
+    #    Strip string literals first to avoid false positives on semicolons in strings
+    _stripped = _STRIP_STRINGS_RE.sub("''", upper)
+    if ";" in _stripped.rstrip(";"):
+        raise ValueError("Multiple statements (stacked queries) are not allowed in the playground.")
 
     conn = _get_sandbox_connection()
     try:

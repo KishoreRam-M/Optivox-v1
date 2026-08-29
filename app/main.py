@@ -68,8 +68,16 @@ logger = logging.getLogger("OptiVox")
 
 # ── Global state ──────────────────────────────────────────────────────────
 
-_executor = ThreadPoolExecutor(max_workers=4)
+import threading
+
+# Two separate thread pools to prevent embedding I/O from starving SQL execution:
+#   _executor       — CPU-bound / SQL-execution tasks (LangGraph agents, DB queries)
+#   _embed_executor — I/O-bound embedding + Pinecone calls (5 RPM limited)
+_executor       = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sql-worker")
+_embed_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embed-worker")
+
 _session_histories: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+_session_lock = threading.Lock()
 _active_connections: List[Dict[str, Any]] = []
 _ws_clients: List[WebSocket] = []
 
@@ -178,6 +186,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("OptiVox DB shutting down.")
     _executor.shutdown(wait=False)
+    _embed_executor.shutdown(wait=False)
 
 
 async def _background_startup():
@@ -247,16 +256,18 @@ app.include_router(csv_db_router)
 # ── Rate limiting ─────────────────────────────────────────────────────────
 
 _rate_limits: Dict[str, List[float]] = defaultdict(list)
+_rate_lock = threading.Lock()
 RATE_LIMIT_MAX = 60
 RATE_LIMIT_WINDOW = 60
 
 
 def _check_rate_limit(client_ip: str) -> bool:
     now = time.time()
-    _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if now - t < RATE_LIMIT_WINDOW]
-    if len(_rate_limits[client_ip]) >= RATE_LIMIT_MAX:
-        return False
-    _rate_limits[client_ip].append(now)
+    with _rate_lock:
+        _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if now - t < RATE_LIMIT_WINDOW]
+        if len(_rate_limits[client_ip]) >= RATE_LIMIT_MAX:
+            return False
+        _rate_limits[client_ip].append(now)
     return True
 
 
@@ -264,9 +275,10 @@ async def _cleanup_rate_limits():
     while True:
         await asyncio.sleep(600)
         now = time.time()
-        stale = [ip for ip, times in _rate_limits.items() if not [t for t in times if now - t < RATE_LIMIT_WINDOW]]
-        for ip in stale:
-            _rate_limits.pop(ip, None)
+        with _rate_lock:
+            stale = [ip for ip, times in _rate_limits.items() if not [t for t in times if now - t < RATE_LIMIT_WINDOW]]
+            for ip in stale:
+                _rate_limits.pop(ip, None)
 
 
 # ── Middleware ────────────────────────────────────────────────────────────
@@ -369,7 +381,8 @@ async def generate_query(
         from app.rag.embedder import fetch_schema_context, fetch_query_history
         schema_context = fetch_schema_context(req.question)
         few_shot = fetch_query_history(req.question)
-    except Exception:
+    except Exception as _rag_exc:
+        logger.warning("[/api/query] RAG fetch failed — proceeding without context: %s", _rag_exc)
         schema_context, few_shot = "", ""
 
     history_str = json.dumps(history[-3:]) if history else "None"
@@ -575,7 +588,8 @@ async def adia_nl_sql(
         from app.rag.embedder import fetch_schema_context, fetch_query_history
         schema_context = fetch_schema_context(req.question)
         few_shot = fetch_query_history(req.question)
-    except Exception:
+    except Exception as _rag_exc:
+        logger.warning("[/api/query/agent] RAG fetch failed — proceeding without context: %s", _rag_exc)
         schema_context, few_shot = "", ""
 
     if req.mode == "agent":
