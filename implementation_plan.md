@@ -2,22 +2,20 @@
 
 This plan outlines a step-by-step approach to hosting your full-stack application (Optivox-v1) entirely for free. Based on the project structure, it consists of a Vite-based **Frontend** and a Python-based **Backend** (likely FastAPI) that uses local LanceDB storage.
 
-## User Review Required
-
-> [!WARNING]
-> **Database Persistence (LanceDB)**
-> The free tier of most hosting platforms (like Render or Koyeb) uses **ephemeral (temporary) storage**. Since LanceDB stores its data as files in the `lancedb_data` directory, any new data added to the vector database will be lost every time the free backend goes to sleep or restarts.
-> **Workarounds**: 
-> 1. If your data is static, you can commit the `lancedb_data` folder to GitHub so it's loaded on startup.
-> 2. If you need dynamic persistence for free, you might need to switch to a free cloud vector database like **Pinecone** or **Supabase**, or use **Hugging Face Spaces** (which can offer persistent storage).
->
-> Let me know how you want to handle the database storage!
-
-## Open Questions
+## Setup Pinecone (Vector Database)
 
 > [!IMPORTANT]
-> 1. **Do you have a GitHub account?** Both free hosting platforms recommended below require your code to be pushed to a GitHub repository.
-> 2. **Is your backend using FastAPI?** The startup command depends on your framework. I will assume FastAPI for now (`uvicorn app.main:app`). Let me know if it's different.
+> Good news! I reviewed the codebase and Optivox-v1 is already built to use **Pinecone** natively for vector storage (in `app/rag/embedder.py`). You do **not** need LanceDB.
+> 
+> **Action Required**: 
+> 1. Go to [Pinecone](https://app.pinecone.io/) and create a free account.
+> 2. Create a new Serverless index (name it `optivox-rag`, dimension `768`, metric `cosine`, region `aws us-east-1`).
+> 3. Get your API Key. You will need to add `PINECONE_API_KEY` to your environment variables on Render.
+
+## GitHub Status
+
+> [!TIP]
+> I have automatically committed your latest changes and pushed them to your GitHub repository `KishoreRam-M/Optivox-v1`. You are ready for deployment!
 
 ## Proposed Hosting Architecture
 
@@ -28,11 +26,10 @@ We will split the deployment into two distinct services using top-tier free plat
 
 ---
 
-### Step 1: Push to GitHub
+### Step 1: Push to GitHub (Completed ✅)
 
-Before deploying, your code needs to be version-controlled.
-1. Create a new public or private repository on [GitHub](https://github.com/).
-2. Push your `Optivox-v1` directory to this repository.
+Your code is already version-controlled and pushed to your repository (`KishoreRam-M/Optivox-v1`).
+You are ready to move on to Step 2!
 
 ---
 
